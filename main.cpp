@@ -41,6 +41,7 @@ struct Ciphertext {
 
 std::vector<uint64_t> poly_mult_naive (const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, uint64_t q){
     std::vector<__uint128_t> intermediate(2 * N -1, 0);
+    #pragma omp parallel for
     for(int i=0;i<N;i++){
         for(int j=0;j<N;j++){
             uint64_t product = (uint64_t)(((__uint128_t)A[i] * B[j]) % q);
@@ -48,6 +49,7 @@ std::vector<uint64_t> poly_mult_naive (const std::vector<uint64_t>& A, const std
         }
     }
     std::vector<uint64_t> out(N, 0);
+    #pragma omp parallel for
     for(int i = 0; i < N; ++i) {
         uint64_t val = intermediate[i];
         if (i + N < intermediate.size()) {
@@ -226,7 +228,7 @@ public:
         size_t lvl = current_limbs - 1; 
         size_t nP = P_LIMBS.size();
         std::vector<std::vector<uint64_t>> d_P(nP, std::vector<uint64_t>(N, 0));
-
+        #pragma omp parallel for
         for (int j = 0; j < N; j++) {
             uint64_t sum_frac = 0, v = 0;
             std::vector<uint64_t> x_prime(current_limbs);
@@ -264,7 +266,7 @@ public:
         size_t lvl = current_limbs - 1;
         size_t nP = P_LIMBS.size();
         std::vector<std::vector<uint64_t>> res_Q(current_limbs, std::vector<uint64_t>(N, 0));
-
+        #pragma omp parallel for
         for (int j = 0; j < N; j++) {
             uint64_t sum_frac = 0, v = 0;
             std::vector<uint64_t> x_prime(nP);
@@ -556,6 +558,7 @@ public:
         ct_out.scale = ct.scale / (double)q_last;
 
         for (int p = 0; p < 2; p++) {   //each part of the ct
+            #pragma omp parallel for
             for (int j = 0; j < N; j++) {
                 uint64_t r = ct.parts[p].data[l][j];
                 bool round_up = (r >= q_last_half);
