@@ -11,7 +11,8 @@
 #include <cmath>
 #include <cstdint>
 #include <complex>
-
+#include <unordered_map>
+#include <mutex>
 const double PI = 3.14159265358979323846;
 const int N = 1 << 15; // 1<<15 is 32,768 
 const double DELTA = 1152921504606584833.0; //2^60
@@ -21,7 +22,7 @@ const std::vector<uint64_t> Q_LIMBS = {
     1152921504606584833ULL, 1152921504598720513ULL, 1152921504597016577ULL,
     1152921504595968001ULL, 1152921504592822273ULL, 1152921504592429057ULL,
     1152921504589938689ULL, 1152921504586530817ULL, 1152921504583647233ULL,
-    1152921504581419009ULL, 1152921504553238471ULL, 1152921504553238597ULL
+    1152921504581419009ULL, 1152921504552910849ULL, 1152921504552583169ULL
 };
 const std::vector<uint64_t> P_LIMBS = {
     1152921504580894721ULL, 1152921504578666497ULL, 1152921504578273281ULL,
@@ -41,7 +42,7 @@ struct Ciphertext {
 
 std::vector<uint64_t> poly_mult_naive (const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, uint64_t q){
     std::vector<__uint128_t> intermediate(2 * N -1, 0);
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for(int i=0;i<N;i++){
         for(int j=0;j<N;j++){
             uint64_t product = (uint64_t)(((__uint128_t)A[i] * B[j]) % q);
@@ -49,7 +50,7 @@ std::vector<uint64_t> poly_mult_naive (const std::vector<uint64_t>& A, const std
         }
     }
     std::vector<uint64_t> out(N, 0);
-    #pragma omp parallel for
+    // #pragma omp parallel for
     for(int i = 0; i < N; ++i) {
         uint64_t val = intermediate[i];
         if (i + N < intermediate.size()) {
@@ -60,6 +61,151 @@ std::vector<uint64_t> poly_mult_naive (const std::vector<uint64_t>& A, const std
         out[i] = val;
     }
     return out;
+}
+
+
+// helpers
+inline uint64_t mod_exp(uint64_t base, uint64_t exp, uint64_t mod) {
+    uint64_t res = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp % 2 == 1) res = (uint64_t)(((__uint128_t)res * base) % mod);
+        base = (uint64_t)(((__uint128_t)base * base) % mod);
+        exp /= 2;
+    }
+    return res;
+}
+
+inline uint64_t mod_inverse(uint64_t n, uint64_t mod) {
+    return mod_exp(n, mod - 2, mod);
+}
+
+inline uint32_t bit_reverse(uint32_t val, int bit_length) {
+    uint32_t res = 0;
+    for (int i = 0; i < bit_length; i++) {
+        res = (res << 1) | (val & 1);
+        val >>= 1;
+    }
+    return res;
+}
+
+//Twiddle factor precomputation
+struct NTTTables {
+    std::vector<uint64_t> forward_twiddles;
+    std::vector<uint64_t> inverse_twiddles;
+    uint64_t n_inv;
+};
+
+NTTTables precompute_ntt(uint64_t q, int N) {
+    NTTTables tables;
+    tables.forward_twiddles.resize(N);
+    tables.inverse_twiddles.resize(N);
+    tables.n_inv = mod_inverse(N, q);
+
+    //primitive 2N-th root of unity modulo q
+    uint64_t psi = 0;
+    uint64_t test_base = 2;
+    while (true) {
+        psi = mod_exp(test_base, (q - 1) / (2 * N), q);
+        if (mod_exp(psi, N, q) == q - 1) { // condition for psi^N == -1 mod q
+            break;
+        }
+        test_base++;
+    }
+
+    uint64_t psi_inv = mod_inverse(psi, q);
+    
+    int logN = 0;
+    while ((1ULL << logN) < N) logN++;
+
+    //powers in bit-reversed order for linear memory access in loops
+    //WE LOVE THE CACHE BE NICE TO THE CACHE
+    for (int i = 0; i < N; i++) {
+        uint32_t rev = bit_reverse(i, logN);
+        tables.forward_twiddles[i] = mod_exp(psi, rev, q);
+        tables.inverse_twiddles[i] = mod_exp(psi_inv, rev, q);
+    }
+    return tables;
+}
+
+//Cooley-Tukey Forward NTT
+void ntt(std::vector<uint64_t>& a, const std::vector<uint64_t>& twiddles, uint64_t q, int N) {
+    int t = N;
+    for (int m = 1; m < N; m <<= 1) {
+        t >>= 1;
+        for (int i = 0; i < m; i++) {
+            int j1 = 2 * i * t;
+            int j2 = j1 + t - 1;
+            uint64_t W = twiddles[m + i];
+            for (int j = j1; j <= j2; j++) {
+                uint64_t U = a[j];
+                uint64_t V = (uint64_t)(((__uint128_t)a[j + t] * W) % q);
+                a[j] = (U + V) % q;
+                a[j + t] = (U + q - V) % q;
+            }
+        }
+    }
+}
+
+//Gentleman-Sande Inverse NTT
+void intt(std::vector<uint64_t>& a, const std::vector<uint64_t>& inv_twiddles, uint64_t q, int N, uint64_t n_inv) {
+    int t = 1;
+    for (int m = N; m > 1; m >>= 1) {
+        int j1 = 0;
+        int h = m >> 1;
+        for (int i = 0; i < h; i++) {
+            int j2 = j1 + t - 1;
+            uint64_t W = inv_twiddles[h + i];
+            for (int j = j1; j <= j2; j++) {
+                uint64_t U = a[j];
+                uint64_t V = a[j + t];
+                a[j] = (U + V) % q;
+                a[j + t] = (uint64_t)(((__uint128_t)(U + q - V) * W) % q);
+            }
+            j1 += 2 * t;
+        }
+        t <<= 1;
+    }
+    //normalization
+    for (int i = 0; i < N; i++) {
+        a[i] = (uint64_t)(((__uint128_t)a[i] * n_inv) % q);
+    }
+}
+
+std::vector<uint64_t> ntt_mul(const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, uint64_t q) {
+    int N = A.size();
+    
+    //cache twiddles per prime to guarantee O(N log N) speed on repeat calls
+    static std::unordered_map<uint64_t, NTTTables> cache;
+    static std::mutex cache_mutex;
+    
+    NTTTables tables;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (cache.find(q) == cache.end()) {
+            cache[q] = precompute_ntt(q, N);
+        }
+        tables = cache[q];
+    }
+
+    //mutable copies
+    std::vector<uint64_t> a_ntt = A;
+    std::vector<uint64_t> b_ntt = B;
+    
+    ntt(a_ntt, tables.forward_twiddles, q, N);
+    ntt(b_ntt, tables.forward_twiddles, q, N);
+    
+    std::vector<uint64_t> c_ntt(N);
+    
+    //Pointwise multiplication 
+    //(A and B are in bit-reversed order, which is perfectly fine!)
+    for(int i = 0; i < N; i++) {
+        c_ntt[i] = (uint64_t)(((__uint128_t)a_ntt[i] * b_ntt[i]) % q);
+    }
+    
+    intt(c_ntt, tables.inverse_twiddles, q, N, tables.n_inv);
+    
+    return c_ntt;
 }
 inline uint64_t wrap(int64_t x, uint64_t q) {
     int64_t rem = x % (int64_t)q;
@@ -193,7 +339,7 @@ public:
             for(int j = 0; j < N; j++) {
                 a[j] = dist(gen); s_mod[j] = wrap(secret[j], mod); s2_mod[j] = wrap(s2[j], mod);
             }
-            std::vector<uint64_t> as = poly_mult_naive(a, s_mod, mod);
+            std::vector<uint64_t> as = ntt_mul(a, s_mod, mod);
             for(int j = 0; j < N; j++) {
                 uint64_t base = (mod - as[j]) % mod;
                 base = (base + wrap(global_e[j], mod)) % mod;
@@ -211,7 +357,7 @@ public:
             for(int j = 0; j < N; j++) {
                 a[j] = dist(gen); s_mod[j] = wrap(secret[j], mod);
             }
-            std::vector<uint64_t> as = poly_mult_naive(a, s_mod, mod);
+            std::vector<uint64_t> as = ntt_mul(a, s_mod, mod);
             for(int j = 0; j < N; j++) {
                 uint64_t base = (mod - as[j]) % mod;
                 rlk.b_P[i][j] = (base + wrap(global_e[j], mod)) % mod;
@@ -228,7 +374,7 @@ public:
         size_t lvl = current_limbs - 1; 
         size_t nP = P_LIMBS.size();
         std::vector<std::vector<uint64_t>> d_P(nP, std::vector<uint64_t>(N, 0));
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (int j = 0; j < N; j++) {
             uint64_t sum_frac = 0, v = 0;
             std::vector<uint64_t> x_prime(current_limbs);
@@ -266,7 +412,7 @@ public:
         size_t lvl = current_limbs - 1;
         size_t nP = P_LIMBS.size();
         std::vector<std::vector<uint64_t>> res_Q(current_limbs, std::vector<uint64_t>(N, 0));
-        #pragma omp parallel for
+        // #pragma omp parallel for
         for (int j = 0; j < N; j++) {
             uint64_t sum_frac = 0, v = 0;
             std::vector<uint64_t> x_prime(nP);
@@ -436,7 +582,7 @@ public:
             }
 
             //A * S
-            std::vector<uint64_t> as = poly_mult_naive(a, sk_limb, qi);
+            std::vector<uint64_t> as = ntt_mul(a, sk_limb, qi);
 
             //c0 and c1
             for (int j = 0; j < N; ++j) {
@@ -465,7 +611,7 @@ public:
             }
             
             //compute c1 * s mod qi
-            std::vector<uint64_t> c1s = poly_mult_naive(ct.parts[1].data[i], sk_limb, qi);
+            std::vector<uint64_t> c1s = ntt_mul(ct.parts[1].data[i], sk_limb, qi);
             
             //compute m = c0 + c1*s mod qi
             for (int j = 0; j < N; ++j) {
@@ -501,11 +647,11 @@ public:
         std::vector<std::vector<uint64_t>> d0(current_limbs), d1(current_limbs), d2(current_limbs);
         for (size_t i = 0; i < current_limbs; i++) {
             uint64_t qi = Q_LIMBS[i];
-            d0[i] = poly_mult_naive(ct1.parts[0].data[i], ct2.parts[0].data[i], qi);
-            d2[i] = poly_mult_naive(ct1.parts[1].data[i], ct2.parts[1].data[i], qi);
+            d0[i] = ntt_mul(ct1.parts[0].data[i], ct2.parts[0].data[i], qi);
+            d2[i] = ntt_mul(ct1.parts[1].data[i], ct2.parts[1].data[i], qi);
             
-            auto cross1 = poly_mult_naive(ct1.parts[0].data[i], ct2.parts[1].data[i], qi);
-            auto cross2 = poly_mult_naive(ct1.parts[1].data[i], ct2.parts[0].data[i], qi);
+            auto cross1 = ntt_mul(ct1.parts[0].data[i], ct2.parts[1].data[i], qi);
+            auto cross2 = ntt_mul(ct1.parts[1].data[i], ct2.parts[0].data[i], qi);
             
             d1[i].resize(N);
             for (int j = 0; j < N; j++) d1[i][j] = (cross1[j] + cross2[j]) % qi;
@@ -515,12 +661,12 @@ public:
         std::vector<std::vector<uint64_t>> d2_P = fast_mod_up(d2);
         std::vector<std::vector<uint64_t>> r0_Q(current_limbs), r1_Q(current_limbs), r0_P(nP), r1_P(nP);
         for (size_t i = 0; i < current_limbs; i++) {
-            r0_Q[i] = poly_mult_naive(d2[i], rlk.b_Q[i], Q_LIMBS[i]);
-            r1_Q[i] = poly_mult_naive(d2[i], rlk.a_Q[i], Q_LIMBS[i]);
+            r0_Q[i] = ntt_mul(d2[i], rlk.b_Q[i], Q_LIMBS[i]);
+            r1_Q[i] = ntt_mul(d2[i], rlk.a_Q[i], Q_LIMBS[i]);
         }
         for (size_t k = 0; k < nP; k++) {
-            r0_P[k] = poly_mult_naive(d2_P[k], rlk.b_P[k], P_LIMBS[k]);
-            r1_P[k] = poly_mult_naive(d2_P[k], rlk.a_P[k], P_LIMBS[k]);
+            r0_P[k] = ntt_mul(d2_P[k], rlk.b_P[k], P_LIMBS[k]);
+            r1_P[k] = ntt_mul(d2_P[k], rlk.a_P[k], P_LIMBS[k]);
         }
 
         auto relin_c0 = fast_mod_down(r0_Q, r0_P);
@@ -558,7 +704,7 @@ public:
         ct_out.scale = ct.scale / (double)q_last;
 
         for (int p = 0; p < 2; p++) {   //each part of the ct
-            #pragma omp parallel for
+            // #pragma omp parallel for
             for (int j = 0; j < N; j++) {
                 uint64_t r = ct.parts[p].data[l][j];
                 bool round_up = (r >= q_last_half);
