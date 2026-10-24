@@ -14,11 +14,20 @@
 
 const double PI = 3.14159265358979323846;
 const int N = 1 << 3; 
-const double DELTA = 1000000000; // 2^40;
+const double DELTA = 1099511627776.0; //2^40
 
+// 60-bit primes (congruent to 1 mod 2N for future NTT compatibility)
 const std::vector<uint64_t> Q_LIMBS = {
-    1073741827, 1073741831, 1073741833, 1073741839, 1073741843, 
-    1073741857, 1073741891, 1073741909, 1073741939, 1073741953
+    1152921504606584833ULL,
+    1152921504598720513ULL,
+    1152921504597016577ULL,
+    1152921504595968001ULL,
+    1152921504595640321ULL,
+    1152921504593739777ULL,
+    1152921504592822273ULL,
+    1152921504589938689ULL,
+    1152921504586530817ULL,
+    1152921504580894721ULL
 };
 
 struct Plaintext {
@@ -33,7 +42,7 @@ std::vector<uint64_t> poly_mult_naive (const std::vector<uint64_t>& A, const std
     std::vector<__uint128_t> intermediate(2 * N -1, 0);
     for(int i=0;i<N;i++){
         for(int j=0;j<N;j++){
-            uint64_t product = (A[i] * B[j]) % q;
+            uint64_t product = (uint64_t)(((__uint128_t)A[i] * B[j]) % q);
             intermediate[i + j] = (intermediate[i+j]+product) % q;
         }
     }
@@ -95,7 +104,7 @@ public:
                 sum += w_matrix[i][j] * y[j];
             }
             //vals in the front, conj in the back
-            uint64_t mi = std::round((sum.real() / N) * DELTA);
+            int64_t mi = std::round((sum.real() / N) * DELTA);
             for (size_t k = 0; k < Q_LIMBS.size(); ++k) {
                 pt.data[k][i] = wrap(mi, Q_LIMBS[k]);
             }
@@ -160,13 +169,92 @@ public:
         
         return res;
     }
+    Ciphertext encrypt(const Plaintext& pt, const std::vector<int>& secret){
+        Ciphertext ct;
+        ct.parts.resize(2, Plaintext());
+        //setup RNG for sampling the masking polynomial a
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::vector<int64_t> global_e(N);
+        std::normal_distribution<double> gaussian_dist(0.0, 1.78885);
+        for (int j = 0; j < N; ++j) {
+            global_e[j] = std::round(gaussian_dist(gen));
+        }
+        for(int i=0;i<Q_LIMBS.size();i++){
+            uint64_t qi = Q_LIMBS[i];
+            //gen a
+            std::uniform_int_distribution<uint64_t> distrib(0, qi - 1);
+            
+            std::vector<uint64_t> a(N);
+            std::vector<uint64_t> e_limb(N);
+            for (int j = 0; j < N; ++j) {
+                a[j] = distrib(gen);
+                
+                e_limb[j] = wrap(global_e[j], qi);
+            }
+            std::vector<uint64_t> sk_limb(N);
+            for (int j = 0; j < N; ++j) {
+                //warp sk so no neg
+                sk_limb[j] = wrap(secret[j], qi); 
+            }
+
+            //A * S
+            std::vector<uint64_t> as = poly_mult_naive(a, sk_limb, qi);
+
+            //c0 and c1
+            for (int j = 0; j < N; ++j) {
+                //c0 = m - a*s + e mod qi
+                uint64_t base_c0 = (pt.data[i][j] + qi - as[j]) % qi;
+                ct.parts[0].data[i][j] = (base_c0 + e_limb[j]) % qi;
+                
+                // c1 = a
+                ct.parts[1].data[i][j] = a[j];
+            }
+        }
+        return ct;
+    }
+    Plaintext decrypt(const Ciphertext& ct, const std::vector<int>& secret){
+        Plaintext pt;
+        
+        for (size_t i = 0; i < Q_LIMBS.size(); ++i) {
+            uint64_t qi = Q_LIMBS[i];
+            
+            //project secret key into field
+            std::vector<uint64_t> sk_limb(N);
+            for (int j = 0; j < N; ++j) {
+                sk_limb[j] = wrap(secret[j], qi);
+            }
+            
+            //compute c1 * s mod qi
+            std::vector<uint64_t> c1s = poly_mult_naive(ct.parts[1].data[i], sk_limb, qi);
+            
+            //compute m = c0 + c1*s mod qi
+            for (int j = 0; j < N; ++j) {
+                pt.data[i][j] = (ct.parts[0].data[i][j] + c1s[j]) % qi;
+            }
+        }
+        return pt;
+    }
 };
 void print_vector(const std::vector<uint64_t> toPrint){
     for(int i=0;i<4;i++){
-        std::cout << toPrint[i] << " " << std::endl;
+        std::cout << toPrint[i] << " ";
     }
+    std::cout << "" << std::endl;
 }
 int main(){
+
+    //setup sk
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<int> distrib(-1, 1);
+    std::vector<int> s_key(N,0);
+    for(int i=0;i<N;i++){
+        s_key[i] = distrib(gen);
+    }
+
+
+
     std::vector<uint64_t> cleartext0(N/2, 0);
     std::vector<uint64_t> cleartext1(N/2, 0);
     cleartext0[0] = 1;
@@ -178,7 +266,12 @@ int main(){
     CKKSEngine engine;
     Plaintext pt = engine.encode(cleartext0);
     print_vector(pt.data[0]);
+    Ciphertext ct = engine.encrypt(pt, s_key);
+    std::cout << "\nEncrypted c0 (Limb 0): " << std::endl;
+    print_vector(ct.parts[0].data[0]);
+    pt = engine.decrypt(ct, s_key);
     std::vector<uint64_t> result = engine.decode(pt);
+    std::cout << "\n Result: " << std::endl;
     print_vector(result);
     return 0;
 }
