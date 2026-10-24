@@ -17,8 +17,8 @@ const int N = 1 << 3;
 const double DELTA = 1000000000; // 2^40;
 
 const std::vector<uint64_t> Q_LIMBS = {
-    1073741827, 1073742223, 1073742283, 1073742317, 1073742367, 
-    1073742391, 1073742419, 1073742461, 1073742511, 1073742523
+    1073741827, 1073741831, 1073741833, 1073741839, 1073741843, 
+    1073741857, 1073741891, 1073741909, 1073741939, 1073741953
 };
 
 struct Plaintext {
@@ -102,6 +102,64 @@ public:
         }
         return pt;
     }
+    std::vector<uint64_t> decode(const Plaintext& pt) {
+        //crt combine
+        //gmp bigint
+        mpz_class Q = 1;
+        for(uint64_t q : Q_LIMBS) {
+            Q *= q;
+        }
+        //shift lower half into negatives
+        mpz_class Q_half = Q / 2;
+
+        std::vector<mpz_class> m_big(N, 0);
+        
+        //recontrsuct
+        for(size_t i = 0; i < Q_LIMBS.size(); ++i) {
+            mpz_class qi = Q_LIMBS[i];
+            mpz_class Mi = Q / qi;
+            
+            //GMP Modulo Inverse: yi = Mi^(-1) mod qi
+            mpz_class yi;
+            mpz_invert(yi.get_mpz_t(), Mi.get_mpz_t(), qi.get_mpz_t());
+            
+            for(int j = 0; j < N; ++j) {
+                mpz_class term = pt.data[i][j];
+                term = (term * Mi * yi) % Q;
+                m_big[j] = (m_big[j] + term) % Q;
+            }
+        }
+
+        //Undo the wrap
+        std::vector<int64_t> m(N);
+        for(int j = 0; j < N; ++j) {
+            if (m_big[j] > Q_half) {
+                m_big[j] -= Q;
+            }
+            // The un-rns coefficient is now small enough
+            m[j] = std::stoll(m_big[j].get_str()); 
+        }
+
+        //evaluating the polynomial at the roots (mult by W* squiggle)
+        std::vector<uint64_t> res(N / 2);
+        std::complex<double> zeta(cos(PI / N), sin(PI / N));
+        
+        //only evaluate at the first N/2 roots because those hold our original real values
+        for (int j = 0; j < N / 2; ++j) {
+            std::complex<double> root = std::pow(zeta, 2 * j + 1);
+            std::complex<double> evaluated(0.0, 0.0);
+            
+            // sum( m[k] * root^k )
+            for (int k = 0; k < N; ++k) {
+                std::complex<double> root_k = std::pow(root, k);
+                evaluated += (double)m[k] * root_k;
+            }
+            
+            res[j] = std::round(evaluated.real() / DELTA);
+        }
+        
+        return res;
+    }
 };
 void print_vector(const std::vector<uint64_t> toPrint){
     for(int i=0;i<4;i++){
@@ -120,5 +178,7 @@ int main(){
     CKKSEngine engine;
     Plaintext pt = engine.encode(cleartext0);
     print_vector(pt.data[0]);
+    std::vector<uint64_t> result = engine.decode(pt);
+    print_vector(result);
     return 0;
 }
