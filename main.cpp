@@ -42,7 +42,7 @@ struct Ciphertext {
 
 std::vector<uint64_t> poly_mult_naive (const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, uint64_t q){
     std::vector<__uint128_t> intermediate(2 * N -1, 0);
-    // #pragma omp parallel for
+    #pragma omp parallel for
     for(int i=0;i<N;i++){
         for(int j=0;j<N;j++){
             uint64_t product = (uint64_t)(((__uint128_t)A[i] * B[j]) % q);
@@ -50,7 +50,7 @@ std::vector<uint64_t> poly_mult_naive (const std::vector<uint64_t>& A, const std
         }
     }
     std::vector<uint64_t> out(N, 0);
-    // #pragma omp parallel for
+    #pragma omp parallel for
     for(int i = 0; i < N; ++i) {
         uint64_t val = intermediate[i];
         if (i + N < intermediate.size()) {
@@ -374,7 +374,7 @@ public:
         size_t lvl = current_limbs - 1; 
         size_t nP = P_LIMBS.size();
         std::vector<std::vector<uint64_t>> d_P(nP, std::vector<uint64_t>(N, 0));
-        // #pragma omp parallel for
+        #pragma omp parallel for
         for (int j = 0; j < N; j++) {
             uint64_t sum_frac = 0, v = 0;
             std::vector<uint64_t> x_prime(current_limbs);
@@ -412,7 +412,7 @@ public:
         size_t lvl = current_limbs - 1;
         size_t nP = P_LIMBS.size();
         std::vector<std::vector<uint64_t>> res_Q(current_limbs, std::vector<uint64_t>(N, 0));
-        // #pragma omp parallel for
+        #pragma omp parallel for
         for (int j = 0; j < N; j++) {
             uint64_t sum_frac = 0, v = 0;
             std::vector<uint64_t> x_prime(nP);
@@ -446,45 +446,33 @@ public:
         return res_Q;
     }
     Plaintext encode(std::vector<uint64_t>& vals){
-        //start by extending to forward ordered hermitian vector
-        std::vector<std::complex<double>> y(N);   //expect n/2 vals
+        std::vector<std::complex<double>> y(N);   
         for (int j = 0; j < N / 2; ++j) {
             y[j] = std::complex<double>(vals[j], 0.0);
-            y[j+N/2] = conj(y[j]); 
-        }
-        
-        
-        
-
-        
-        //primitive 2N root of unity. every other root in vandermonde is just an odd power of this
-        std::complex<double> zeta(cos(PI / N), sin(PI / N));
-
-        //get the rest of the roots
-        std::vector<std::complex<double>> roots(N);
-        //compute first row of W squiggle. rest are just powers
-        for(int i=0;i<N/2;i++){
-            roots[i] = std::pow(zeta, 2 * i + 1);
-            roots[i + N / 2] = std::conj(roots[i]);
-        }
-        //get W squiggle
-        std::vector<std::vector<std::complex<double>>> w_matrix(N, std::vector<std::complex<double>>(N, 0));;
-        for(int i=0;i<N;i++){
-            for(int j=0;j<N;j++){
-                w_matrix[i][j] = std::pow(std::conj(roots[j]), i);
-            }
+            y[j + N / 2] = std::conj(y[j]); 
         }
 
-        //now compute I * W * v / n. 
-        //instead of actually doing mult by I, we just ignore the parts we dont need
         Plaintext pt;  
-        for(int i=0;i<N;i++){
+        
+        //compute the roots dynamically, no w_matrix (it was eating ram like chrome)
+        //just do it each time like a normal person
+        #pragma omp parallel for
+        for(int i = 0; i < N; i++){
             std::complex<double> sum(0.0, 0.0);
-            //be a bit nice to the cache :)
             for (int j = 0; j < N; ++j) {
-                sum += w_matrix[i][j] * y[j];
+                double angle;
+                if (j < N / 2) {
+                    //angle conj(roots[j])^i
+                    angle = -i * (2.0 * j + 1.0) * PI / N;
+                } else {
+                    //now for roots[j-N/2]^i
+                    angle = i * (2.0 * (j - N / 2) + 1.0) * PI / N;
+                }
+                
+                std::complex<double> w_ij(cos(angle), sin(angle));
+                sum += w_ij * y[j];
             }
-            //vals in the front, conj in the back
+            
             int64_t mi = std::round((sum.real() / N) * DELTA);
             for (size_t k = 0; k < Q_LIMBS.size(); ++k) {
                 pt.data[k][i] = wrap(mi, Q_LIMBS[k]);
@@ -645,6 +633,7 @@ public:
         size_t nP = P_LIMBS.size();
         //mult naive for now
         std::vector<std::vector<uint64_t>> d0(current_limbs), d1(current_limbs), d2(current_limbs);
+        #pragma omp parallel for
         for (size_t i = 0; i < current_limbs; i++) {
             uint64_t qi = Q_LIMBS[i];
             d0[i] = ntt_mul(ct1.parts[0].data[i], ct2.parts[0].data[i], qi);
@@ -660,10 +649,12 @@ public:
         //extend to QUP basis and do relin
         std::vector<std::vector<uint64_t>> d2_P = fast_mod_up(d2);
         std::vector<std::vector<uint64_t>> r0_Q(current_limbs), r1_Q(current_limbs), r0_P(nP), r1_P(nP);
+        #pragma omp parallel for
         for (size_t i = 0; i < current_limbs; i++) {
             r0_Q[i] = ntt_mul(d2[i], rlk.b_Q[i], Q_LIMBS[i]);
             r1_Q[i] = ntt_mul(d2[i], rlk.a_Q[i], Q_LIMBS[i]);
         }
+        #pragma omp parallel for
         for (size_t k = 0; k < nP; k++) {
             r0_P[k] = ntt_mul(d2_P[k], rlk.b_P[k], P_LIMBS[k]);
             r1_P[k] = ntt_mul(d2_P[k], rlk.a_P[k], P_LIMBS[k]);
@@ -676,7 +667,7 @@ public:
         ct_out.parts.resize(2, Plaintext());
         ct_out.parts[0].data.resize(current_limbs, std::vector<uint64_t>(N, 0));
         ct_out.parts[1].data.resize(current_limbs, std::vector<uint64_t>(N, 0));
-        
+        #pragma omp parallel for
         for (size_t i = 0; i < current_limbs; i++) {
             uint64_t qi = Q_LIMBS[i];
             for (int j = 0; j < N; j++) {
@@ -704,7 +695,7 @@ public:
         ct_out.scale = ct.scale / (double)q_last;
 
         for (int p = 0; p < 2; p++) {   //each part of the ct
-            // #pragma omp parallel for
+            #pragma omp parallel for
             for (int j = 0; j < N; j++) {
                 uint64_t r = ct.parts[p].data[l][j];
                 bool round_up = (r >= q_last_half);
