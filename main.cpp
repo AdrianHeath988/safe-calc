@@ -18,22 +18,16 @@ const double DELTA = 1099511627776.0; //2^40
 
 // 60-bit primes (congruent to 1 mod 2N for future NTT compatibility)
 const std::vector<uint64_t> Q_LIMBS = {
-    1152921504606584833ULL,
-    1152921504598720513ULL,
-    1152921504597016577ULL,
-    1152921504595968001ULL,
-    1152921504595640321ULL,
-    1152921504593739777ULL,
-    1152921504592822273ULL,
-    1152921504589938689ULL,
-    1152921504586530817ULL,
-    1152921504580894721ULL
+    1152921504606584833ULL, 1152921504598720513ULL, 1152921504597016577ULL,
+    1152921504595968001ULL, 1152921504592822273ULL, 1152921504592429057ULL,
+    1152921504589938689ULL, 1152921504586530817ULL, 1152921504583647233ULL,
+    1152921504581419009ULL
 };
 const std::vector<uint64_t> P_LIMBS = {
-    1152921504550092801ULL, 1152921504546553857ULL, 1152921504545505281ULL,
-    1152921504545243137ULL, 1152921504539869185ULL, 1152921504538558465ULL,
-    1152921504535543809ULL, 1152921504532660225ULL, 1152921504531873793ULL,
-    1152921504523354113ULL, 1152921504521388033ULL
+    1152921504580894721ULL, 1152921504578666497ULL, 1152921504578273281ULL,
+    1152921504577748993ULL, 1152921504577486849ULL, 1152921504570802177ULL,
+    1152921504570277889ULL, 1152921504568836097ULL, 1152921504568442881ULL,
+    1152921504565559297ULL, 1152921504565166081ULL
 };
 struct Plaintext {
     std::vector<std::vector<uint64_t>> data;
@@ -457,10 +451,11 @@ public:
         return ct;
     }
     Ciphertext multiply(const Ciphertext& ct1, const Ciphertext& ct2, const RelinKeyP& rlk) {
-        size_t nQ = Q_LIMBS.size(), nP = P_LIMBS.size();
+        size_t current_limbs = std::min(ct1.parts[0].data.size(), ct2.parts[0].data.size());
+        size_t nP = P_LIMBS.size();
         //mult naive for now
-        std::vector<std::vector<uint64_t>> d0(nQ), d1(nQ), d2(nQ);
-        for (size_t i = 0; i < nQ; i++) {
+        std::vector<std::vector<uint64_t>> d0(current_limbs), d1(current_limbs), d2(current_limbs);
+        for (size_t i = 0; i < current_limbs; i++) {
             uint64_t qi = Q_LIMBS[i];
             d0[i] = poly_mult_naive(ct1.parts[0].data[i], ct2.parts[0].data[i], qi);
             d2[i] = poly_mult_naive(ct1.parts[1].data[i], ct2.parts[1].data[i], qi);
@@ -472,10 +467,10 @@ public:
             for (int j = 0; j < N; j++) d1[i][j] = (cross1[j] + cross2[j]) % qi;
         }
 
-        std::vector<std::vector<uint64_t>> d2_P = fast_mod_up(d2);
         //extend to QUP basis and do relin
-        std::vector<std::vector<uint64_t>> r0_Q(nQ), r1_Q(nQ), r0_P(nP), r1_P(nP);
-        for (size_t i = 0; i < nQ; i++) {
+        std::vector<std::vector<uint64_t>> d2_P = fast_mod_up(d2);
+        std::vector<std::vector<uint64_t>> r0_Q(current_limbs), r1_Q(current_limbs), r0_P(nP), r1_P(nP);
+        for (size_t i = 0; i < current_limbs; i++) {
             r0_Q[i] = poly_mult_naive(d2[i], rlk.b_Q[i], Q_LIMBS[i]);
             r1_Q[i] = poly_mult_naive(d2[i], rlk.a_Q[i], Q_LIMBS[i]);
         }
@@ -490,7 +485,7 @@ public:
         Ciphertext ct_out;
         ct_out.parts.resize(2, Plaintext());
         
-        for (size_t i = 0; i < nQ; i++) {
+        for (size_t i = 0; i < current_limbs; i++) {
             uint64_t qi = Q_LIMBS[i];
             for (int j = 0; j < N; j++) {
                 ct_out.parts[0].data[i][j] = (d0[i][j] + relin_c0[i][j]) % qi;
@@ -578,8 +573,8 @@ int main(){
     std::vector<uint64_t> cleartext1(N/2, 0);
     cleartext0[0] = 2; 
     cleartext0[1] = 3;
-    cleartext1[0] = 4; 
-    cleartext1[1] = 5;
+    cleartext1[0] = 5; 
+    cleartext1[1] = 8;
 
     std::cout << "Encoding + Encrypting vectors" << std::endl;
     Plaintext pt0 = engine.encode(cleartext0);
