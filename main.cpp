@@ -13,15 +13,15 @@
 #include <complex>
 
 const double PI = 3.14159265358979323846;
-const int N = 1 << 3; 
-const double DELTA = 1099511627776.0; //2^40
+const int N = 1 << 15; // 1<<15 is 32,768 
+const double DELTA = 1152921504606584833.0; //2^60
 
 // 60-bit primes (congruent to 1 mod 2N for future NTT compatibility)
 const std::vector<uint64_t> Q_LIMBS = {
     1152921504606584833ULL, 1152921504598720513ULL, 1152921504597016577ULL,
     1152921504595968001ULL, 1152921504592822273ULL, 1152921504592429057ULL,
     1152921504589938689ULL, 1152921504586530817ULL, 1152921504583647233ULL,
-    1152921504581419009ULL
+    1152921504581419009ULL, 1152921504553238471ULL, 1152921504553238597ULL
 };
 const std::vector<uint64_t> P_LIMBS = {
     1152921504580894721ULL, 1152921504578666497ULL, 1152921504578273281ULL,
@@ -71,56 +71,87 @@ class CKKSEngine {
 public:
 
     //setup phase for relin fast auxillirary bassi switch for later
-    std::vector<uint64_t> q_hat_inv_mod_q, p_hat_inv_mod_p;
-    std::vector<std::vector<uint64_t>> q_hat_mod_p, p_hat_mod_q;
-    std::vector<uint64_t> Q_mod_p, P_mod_q, P_inv_mod_q;
+    // --- Public Class Variables ---
+    // [level][i]
+    std::vector<std::vector<uint64_t>> q_hat_inv_mod_q;
+    std::vector<std::vector<uint64_t>> P_mod_q, P_inv_mod_q;
+    
+    //[level][i][j]
+    std::vector<std::vector<std::vector<uint64_t>>> q_hat_mod_p;
+    //[level][j]
+    std::vector<std::vector<uint64_t>> Q_mod_p;
+
+    //static p tables(independent of Q limb drops)
+    std::vector<uint64_t> p_hat_inv_mod_p;
+    std::vector<std::vector<uint64_t>> p_hat_mod_q;
+    
+    //rescale dropping table
     std::vector<std::vector<uint64_t>> q_inv_mod_q; // [limb_to_drop][remaining_limb]
-    //precomputing a translation from the qi limbs to pi
-    //use this so no crt necassary when doing eval steps (avoids big int)
 
     void setup_rns_tables() {
-        mpz_class Q_val = 1; for (auto q : Q_LIMBS) Q_val *= q;
-        mpz_class P_val = 1; for (auto p : P_LIMBS) P_val *= p;
         size_t nQ = Q_LIMBS.size(), nP = P_LIMBS.size();
 
-        q_hat_inv_mod_q.resize(nQ); q_hat_mod_p.resize(nQ, std::vector<uint64_t>(nP)); Q_mod_p.resize(nP);
-        p_hat_inv_mod_p.resize(nP); p_hat_mod_q.resize(nP, std::vector<uint64_t>(nQ)); P_mod_q.resize(nQ);
+        //resize tables
+        q_hat_inv_mod_q.resize(nQ);
+        q_hat_mod_p.resize(nQ);
+        Q_mod_p.resize(nQ);
+        P_mod_q.resize(nQ);
         P_inv_mod_q.resize(nQ);
 
-        //q to p transition tables
-        for (size_t i = 0; i < nQ; i++) {
-            mpz_class Qi = Q_val / Q_LIMBS[i];
-            mpz_class inv; mpz_invert(inv.get_mpz_t(), Qi.get_mpz_t(), mpz_class(Q_LIMBS[i]).get_mpz_t());
-            q_hat_inv_mod_q[i] = inv.get_ui();
+        mpz_class P_val = 1; 
+        for (auto p : P_LIMBS) P_val *= p;
+
+        //q tables
+        for (size_t lvl = 0; lvl < nQ; lvl++) {
+            size_t current_limbs = lvl + 1;
+            
+            mpz_class Q_val = 1; 
+            for (size_t i = 0; i < current_limbs; i++) Q_val *= Q_LIMBS[i];
+
+            q_hat_inv_mod_q[lvl].resize(current_limbs);
+            q_hat_mod_p[lvl].resize(current_limbs, std::vector<uint64_t>(nP));
+            Q_mod_p[lvl].resize(nP);
+            P_mod_q[lvl].resize(current_limbs);
+            P_inv_mod_q[lvl].resize(current_limbs);
+            
+            for (size_t i = 0; i < current_limbs; i++) {
+                mpz_class Qi = Q_val / Q_LIMBS[i];
+                mpz_class inv; 
+                mpz_invert(inv.get_mpz_t(), Qi.get_mpz_t(), mpz_class(Q_LIMBS[i]).get_mpz_t());
+                q_hat_inv_mod_q[lvl][i] = inv.get_ui();
+                
+                for (size_t j = 0; j < nP; j++) {
+                    q_hat_mod_p[lvl][i][j] = mpz_class(Qi % P_LIMBS[j]).get_ui();
+                }
+                
+                P_mod_q[lvl][i] = mpz_class(P_val % Q_LIMBS[i]).get_ui();
+                
+                mpz_class P_inv;
+                mpz_invert(P_inv.get_mpz_t(), P_val.get_mpz_t(), mpz_class(Q_LIMBS[i]).get_mpz_t());
+                P_inv_mod_q[lvl][i] = P_inv.get_ui();
+            }
             
             for (size_t j = 0; j < nP; j++) {
-                // Cast the expression template to mpz_class, then extract 64-bit int
-                q_hat_mod_p[i][j] = mpz_class(Qi % P_LIMBS[j]).get_ui();
+                Q_mod_p[lvl][j] = mpz_class(Q_val % P_LIMBS[j]).get_ui();
             }
         }
-        for (size_t j = 0; j < nP; j++) {
-            Q_mod_p[j] = mpz_class(Q_val % P_LIMBS[j]).get_ui();
-        }
 
-        //p -> q transition tables
+        //P tables
+        p_hat_inv_mod_p.resize(nP); 
+        p_hat_mod_q.resize(nP, std::vector<uint64_t>(nQ));
+        
         for (size_t k = 0; k < nP; k++) {
             mpz_class Pk = P_val / P_LIMBS[k];
-            mpz_class inv; mpz_invert(inv.get_mpz_t(), Pk.get_mpz_t(), mpz_class(P_LIMBS[k]).get_mpz_t());
+            mpz_class inv; 
+            mpz_invert(inv.get_mpz_t(), Pk.get_mpz_t(), mpz_class(P_LIMBS[k]).get_mpz_t());
             p_hat_inv_mod_p[k] = inv.get_ui();
             
             for (size_t i = 0; i < nQ; i++) {
                 p_hat_mod_q[k][i] = mpz_class(Pk % Q_LIMBS[i]).get_ui();
-                // print("HERE 3");
             }
         }
-        for (size_t i = 0; i < nQ; i++) {
-            P_mod_q[i] = mpz_class(P_val % Q_LIMBS[i]).get_ui();
-            mpz_class inv; mpz_invert(inv.get_mpz_t(), P_val.get_mpz_t(), mpz_class(Q_LIMBS[i]).get_mpz_t());
-            P_inv_mod_q[i] = inv.get_ui();
-        }
 
-
-        //for rescale (inv of drop luimbs)
+        //inverse of dropped limbs
         q_inv_mod_q.resize(nQ, std::vector<uint64_t>(nQ));
         for (size_t l = 1; l < nQ; l++) {
             for (size_t i = 0; i < l; i++) {
@@ -165,7 +196,7 @@ public:
                 uint64_t base = (mod - as[j]) % mod;
                 base = (base + wrap(global_e[j], mod)) % mod;
                 
-                uint64_t ps2 = (uint64_t)(((__uint128_t)P_mod_q[i] * s2_mod[j]) % mod);
+                uint64_t ps2 = (uint64_t)(((__uint128_t)P_mod_q[nQ - 1][i] * s2_mod[j]) % mod);
                 rlk.b_Q[i][j] = (base + ps2) % mod;
                 rlk.a_Q[i][j] = a[j];
             }
@@ -191,15 +222,18 @@ public:
     //extend to QUP basis using precomputed swithing
     //do this so later we can use AVX simd
     std::vector<std::vector<uint64_t>> fast_mod_up(const std::vector<std::vector<uint64_t>>& d_Q) {
-        size_t nQ = Q_LIMBS.size(), nP = P_LIMBS.size();
+        size_t current_limbs = d_Q.size();
+        size_t lvl = current_limbs - 1; 
+        size_t nP = P_LIMBS.size();
         std::vector<std::vector<uint64_t>> d_P(nP, std::vector<uint64_t>(N, 0));
 
         for (int j = 0; j < N; j++) {
             uint64_t sum_frac = 0, v = 0;
-            std::vector<uint64_t> x_prime(nQ);
-            for (size_t i = 0; i < nQ; i++) {
+            std::vector<uint64_t> x_prime(current_limbs);
+            
+            for (size_t i = 0; i < current_limbs; i++) {
                 uint64_t qi = Q_LIMBS[i];
-                x_prime[i] = (uint64_t)(((__uint128_t)d_Q[i][j] * q_hat_inv_mod_q[i]) % qi);
+                x_prime[i] = (uint64_t)(((__uint128_t)d_Q[i][j] * q_hat_inv_mod_q[lvl][i]) % qi);
                 uint64_t frac = (uint64_t)(((__uint128_t)x_prime[i] << 64) / qi);
                 uint64_t old = sum_frac;
                 sum_frac += frac;
@@ -212,9 +246,11 @@ public:
             for (size_t k = 0; k < nP; k++) {
                 uint64_t pk = P_LIMBS[k];
                 __uint128_t sum = 0;
-                for (size_t i = 0; i < nQ; i++) sum += (__uint128_t)x_prime[i] * q_hat_mod_p[i][k]; 
+                for (size_t i = 0; i < current_limbs; i++) {
+                    sum += (__uint128_t)x_prime[i] * q_hat_mod_p[lvl][i][k]; 
+                }
                 uint64_t res = sum % pk;
-                uint64_t sub = ((__uint128_t)v * Q_mod_p[k]) % pk;
+                uint64_t sub = ((__uint128_t)v * Q_mod_p[lvl][k]) % pk;
                 d_P[k][j] = (res + pk - sub) % pk;
             }
         }
@@ -223,12 +259,16 @@ public:
 
     std::vector<std::vector<uint64_t>> fast_mod_down(
         const std::vector<std::vector<uint64_t>>& c_Q, const std::vector<std::vector<uint64_t>>& c_P) {
-        size_t nQ = Q_LIMBS.size(), nP = P_LIMBS.size();
-        std::vector<std::vector<uint64_t>> res_Q(nQ, std::vector<uint64_t>(N, 0));
+        
+        size_t current_limbs = c_Q.size();
+        size_t lvl = current_limbs - 1;
+        size_t nP = P_LIMBS.size();
+        std::vector<std::vector<uint64_t>> res_Q(current_limbs, std::vector<uint64_t>(N, 0));
 
         for (int j = 0; j < N; j++) {
             uint64_t sum_frac = 0, v = 0;
             std::vector<uint64_t> x_prime(nP);
+            
             for (size_t k = 0; k < nP; k++) {
                 uint64_t pk = P_LIMBS[k];
                 x_prime[k] = (uint64_t)(((__uint128_t)c_P[k][j] * p_hat_inv_mod_p[k]) % pk);
@@ -241,16 +281,18 @@ public:
             sum_frac += (1ULL << 63); 
             if (sum_frac < old) v++;
 
-            for (size_t i = 0; i < nQ; i++) {
+            for (size_t i = 0; i < current_limbs; i++) {
                 uint64_t qi = Q_LIMBS[i];
                 __uint128_t sum = 0;
-                for (size_t k = 0; k < nP; k++) sum += (__uint128_t)x_prime[k] * p_hat_mod_q[k][i];
+                for (size_t k = 0; k < nP; k++) {
+                    sum += (__uint128_t)x_prime[k] * p_hat_mod_q[k][i];
+                }
                 uint64_t r_mod_qi = sum % qi;
-                uint64_t sub = ((__uint128_t)v * P_mod_q[i]) % qi;
+                uint64_t sub = ((__uint128_t)v * P_mod_q[lvl][i]) % qi;
                 r_mod_qi = (r_mod_qi + qi - sub) % qi;
 
                 uint64_t diff = (c_Q[i][j] + qi - r_mod_qi) % qi;
-                res_Q[i][j] = (uint64_t)(((__uint128_t)diff * P_inv_mod_q[i]) % qi);
+                res_Q[i][j] = (uint64_t)(((__uint128_t)diff * P_inv_mod_q[lvl][i]) % qi);
             }
         }
         return res_Q;
@@ -484,6 +526,8 @@ public:
 
         Ciphertext ct_out;
         ct_out.parts.resize(2, Plaintext());
+        ct_out.parts[0].data.resize(current_limbs, std::vector<uint64_t>(N, 0));
+        ct_out.parts[1].data.resize(current_limbs, std::vector<uint64_t>(N, 0));
         
         for (size_t i = 0; i < current_limbs; i++) {
             uint64_t qi = Q_LIMBS[i];
@@ -572,26 +616,50 @@ int main(){
     std::vector<uint64_t> cleartext0(N/2, 0);
     std::vector<uint64_t> cleartext1(N/2, 0);
     cleartext0[0] = 2; 
-    cleartext0[1] = 3;
     cleartext1[0] = 5; 
-    cleartext1[1] = 8;
 
     std::cout << "Encoding + Encrypting vectors" << std::endl;
     Plaintext pt0 = engine.encode(cleartext0);
     Plaintext pt1 = engine.encode(cleartext1);
     Ciphertext ct0 = engine.encrypt(pt0, s_key);
     Ciphertext ct1 = engine.encrypt(pt1, s_key);
-
-    std::cout << "mult + relin" << std::endl;
-    Ciphertext ct_mult = engine.multiply(ct0, ct1, rlk);
-    std::cout << "Rescaling to manage noise and scale" << std::endl;
+    //calculate/benchamark based on instruictions per cycle
+    // perf stat -e cycles,instructions,uops_executed.core,avx_insts.all ./your_benchmark
+    std::cout << "Begining depth 10 circuit 5*2^10:" << std::endl;
+    auto start = std::chrono::steady_clock::now();
+    Ciphertext ct_mult = engine.multiply(ct0, ct1, rlk);    //1
     Ciphertext ct_rescaled = engine.rescale(ct_mult);
+    ct_mult = engine.multiply(ct0, ct_rescaled, rlk); //2
+    ct_rescaled = engine.rescale(ct_mult);
+    ct_mult = engine.multiply(ct0, ct_rescaled, rlk);//3
+    ct_rescaled = engine.rescale(ct_mult);
+    ct_mult = engine.multiply(ct0, ct_rescaled, rlk);//4
+    ct_rescaled = engine.rescale(ct_mult);
+    ct_mult = engine.multiply(ct0, ct_rescaled, rlk);//5
+    ct_rescaled = engine.rescale(ct_mult);
+    ct_mult = engine.multiply(ct0, ct_rescaled, rlk);//6
+    ct_rescaled = engine.rescale(ct_mult);
+    ct_mult = engine.multiply(ct0, ct_rescaled, rlk);//7
+    ct_rescaled = engine.rescale(ct_mult);
+    ct_mult = engine.multiply(ct0, ct_rescaled, rlk);//8
+    ct_rescaled = engine.rescale(ct_mult);
+    ct_mult = engine.multiply(ct0, ct_rescaled, rlk);//9
+    ct_rescaled = engine.rescale(ct_mult);
+    ct_mult = engine.multiply(ct0, ct_rescaled, rlk);//10
+    ct_rescaled = engine.rescale(ct_mult);
+    auto end = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::cout << "Elapsed time: " << elapsed.count() << " ms\n";
+    //# plaintext ops is N/2 * 10
+    std::cout << "Total number of plaintext operations = 10 * 16,384 = 163,840"<< std::endl;
+    std::cout << "Total number of plaintext operations per second: " << 163840.0/(elapsed.count()/1000.0) << std::endl;
+    // std::cout << m_ops/(elapsed.count() /1000.0) << " million operations per second." <<std::endl;
+
     std::cout << "decrypting" << std::endl;
     Plaintext pt_mult = engine.decrypt(ct_rescaled, s_key);
     std::vector<double> result = engine.decode(pt_mult);
     
-    std::cout << "\nExpected Result: 8 15 0 0" << std::endl;
-    std::cout << "Actual Result:   ";
+    std::cout << "Expected 5120, Result:   ";
     print_vector(result);
 
     return 0;
