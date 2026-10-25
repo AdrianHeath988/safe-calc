@@ -231,6 +231,7 @@ static inline __m512i split2_v(uint64_t a, uint64_t b) {
 }
 
 // ---------- forward NTT (Cooley-Tukey), AVX-512 ----------
+//I LOVE __restrict I LOVE __restrict I LOVE __restrict
 void ntt(std::vector<uint64_t>& a, const NTTTables& T, uint64_t q, int N) {
     const __m512i vq = _mm512_set1_epi64((long long)q), vq2 = _mm512_set1_epi64((long long)(2 * q));
     uint64_t* __restrict A = a.data();
@@ -246,6 +247,8 @@ void ntt(std::vector<uint64_t>& a, const NTTTables& T, uint64_t q, int N) {
             const __m512i Wp = _mm512_set1_epi64((long long)Wps[m + i]);
             uint64_t* x = A + 2 * (size_t)i * t;
             uint64_t* y = x + t;
+            //UNROLL THIS LOOP OR I WILL NEVER GIVE YOU A #likely AGAIN
+            #pragma unroll 4
             for (int j = 0; j < t; j += 8) {
                 __m512i X = _mm512_loadu_si512(x + j), Y = _mm512_loadu_si512(y + j);
                 fwd_bfly_v(X, Y, W, Wp, vq, vq2);
@@ -332,6 +335,7 @@ void intt(std::vector<uint64_t>& a, const NTTTables& T, uint64_t q, int N) {
             const __m512i Wp = _mm512_set1_epi64((long long)Wps[h + i]);
             uint64_t* x = A + 2 * (size_t)i * t;
             uint64_t* y = x + t;
+            #pragma unroll 4
             for (int j = 0; j < t; j += 8) {
                 __m512i X = _mm512_loadu_si512(x + j), Y = _mm512_loadu_si512(y + j);
                 inv_bfly_v(X, Y, W, Wp, vq, vq2);
@@ -945,6 +949,8 @@ public:
             const Red& R = redQ[i];
             const auto &a0 = ct1.parts[0].data[i], &a1 = ct1.parts[1].data[i];
             const auto &b0 = ct2.parts[0].data[i], &b1 = ct2.parts[1].data[i];
+            //LLVM WILL OBEY ME OR SO HELP ME GOD
+            #pragma unroll 8
             for (int j = 0; j < N; j++) {
                 d0[i][j] = red128((__uint128_t)a0[j] * b0[j], R);
                 d2[i][j] = red128((__uint128_t)a1[j] * b1[j], R);
@@ -998,6 +1004,8 @@ public:
             std::vector<uint64_t> acc0(N), acc1(N);
             for (int j = 0; j < N; j++) {
                 __uint128_t s0 = 0, s1 = 0;
+                //YOU WILL PARRALELIZE OR YOU WILL SERIALIZE 6 FEET UNDER                    
+                #pragma unroll 8
                 for (size_t k = 0; k < L; k++) {
                     s0 += (__uint128_t)lfp[k][j] * kbp[k][j];
                     s1 += (__uint128_t)lfp[k][j] * kap[k][j];
