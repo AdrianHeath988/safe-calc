@@ -463,7 +463,8 @@ public:
 
 
     //c_Q: ntt form, modified in place.  c_P: coefficient form.
-    void mod_down_ntt(std::vector<std::vector<uint64_t>>& c_Q, const std::vector<uint64_t>& c_P) {
+    void mod_down_ntt(std::vector<std::vector<uint64_t>>& c_Q, const std::vector<uint64_t>& c_P,
+                      const std::vector<std::vector<uint64_t>>& d) {
         size_t L = c_Q.size(), lvl = L - 1;
         uint64_t p0 = P_LIMBS[0], p_half = p0 / 2;
         #pragma omp parallel for
@@ -472,13 +473,12 @@ public:
             std::vector<uint64_t> e(N);
             for (int j = 0; j < N; j++) {
                 uint64_t ep = c_P[j];
-                // all primes are ~2^60, so p0-ep < p0/2 < qi and ep <= p0/2 < qi: no division
                 e[j] = (ep > p_half) ? qi - (p0 - ep) : ep;
             }
             ntt(e, *tabQ[i], qi, N);
             const uint64_t c = P_inv_mod_q[lvl][i], cp = Pinv_p[lvl][i];
             for (int j = 0; j < N; j++)
-                c_Q[i][j] = mulc(submod(c_Q[i][j], e[j], qi), c, cp, qi);
+                c_Q[i][j] = addmod(mulc(submod(c_Q[i][j], e[j], qi), c, cp, qi), d[i][j], qi);
         }
     }
     void setup_rns_tables() {
@@ -978,61 +978,51 @@ public:
             const NTTTables& T = isP ? *tabP[0] : *tabQ[t];
             const Red& R = isP ? redP : redQ[t];
 
-            // 128-bit lazy accumulators: 12 terms * 2^120 < 2^124, no overflow
-            std::vector<__uint128_t> a0(N, 0), a1(N, 0);
-            std::vector<uint64_t> lifted(N);
+            static thread_local std::vector<std::vector<uint64_t>> LF;
+            if (LF.size() < L) LF.resize(L);
 
+            const uint64_t *lfp[16], *kbp[16], *kap[16];
             for (size_t k = 0; k < L; k++) {
-                const uint64_t* lf;
                 if (!isP && (size_t)t == k) {
-                    lf = dig_ntt[k].data();               // skip: already NTT form
+                    lfp[k] = dig_ntt[k].data();               // already NTT form
                 } else {
-                    for (int j = 0; j < N; j++) lifted[j] = lift_signed(digits[k][j], mod);
-                    ntt(lifted, T, mod, N);
-                    lf = lifted.data();
+                    LF[k].resize(N);
+                    for (int j = 0; j < N; j++) LF[k][j] = lift_signed(digits[k][j], mod);
+                    ntt(LF[k], T, mod, N);
+                    lfp[k] = LF[k].data();
                 }
-                const auto& kb = isP ? rlk.b_P[k][0] : rlk.b_Q[k][t];   // NTT domain
-                const auto& ka = isP ? rlk.a_P[k][0] : rlk.a_Q[k][t];
-                for (int j = 0; j < N; j++) {
-                    a0[j] += (__uint128_t)lf[j] * kb[j];
-                    a1[j] += (__uint128_t)lf[j] * ka[j];
-                }
+                kbp[k] = (isP ? rlk.b_P[k][0] : rlk.b_Q[k][t]).data();
+                kap[k] = (isP ? rlk.a_P[k][0] : rlk.a_Q[k][t]).data();
             }
 
-            // one reduction per coefficient, after all k terms are summed
             std::vector<uint64_t> acc0(N), acc1(N);
             for (int j = 0; j < N; j++) {
-                acc0[j] = red128(a0[j], R);
-                acc1[j] = red128(a1[j], R);
+                __uint128_t s0 = 0, s1 = 0;
+                for (size_t k = 0; k < L; k++) {
+                    s0 += (__uint128_t)lfp[k][j] * kbp[k][j];
+                    s1 += (__uint128_t)lfp[k][j] * kap[k][j];
+                }
+                acc0[j] = red128(s0, R);
+                acc1[j] = red128(s1, R);
             }
 
-            if (isP) {   // only the P limb goes back to coefficients
+            if (isP) {
                 intt(acc0, T, mod, N);
                 intt(acc1, T, mod, N);
                 r0_P = std::move(acc0); r1_P = std::move(acc1);
-            } else {     // Q limbs stay in NTT form
+            } else {
                 r0_Q[t] = std::move(acc0); r1_Q[t] = std::move(acc1);
             }
         }
         g_ph[2] += omp_get_wtime() - w; w = omp_get_wtime();
         //mod-down in NTT form (in place)
-        mod_down_ntt(r0_Q, r0_P);
-        mod_down_ntt(r1_Q, r1_P);
+        mod_down_ntt(r0_Q, r0_P, d0);
+        mod_down_ntt(r1_Q, r1_P, d1);
         g_ph[3] += omp_get_wtime() - w; w = omp_get_wtime();
-        //combine, reusing d0/d1 buffers
         Ciphertext out;
         out.parts.resize(2);
-        out.parts[0].data = std::move(d0);
-        out.parts[1].data = std::move(d1);
-        #pragma omp parallel for
-        for (int i = 0; i < (int)L; i++) {
-            uint64_t qi = Q_LIMBS[i];
-            for (int j = 0; j < N; j++) {
-                out.parts[0].data[i][j] = addmod(out.parts[0].data[i][j], r0_Q[i][j], qi);
-                out.parts[1].data[i][j] = addmod(out.parts[1].data[i][j], r1_Q[i][j], qi);
-            }
-        }
-        g_ph[4] += omp_get_wtime() - w; w = omp_get_wtime();
+        out.parts[0].data = std::move(r0_Q);
+        out.parts[1].data = std::move(r1_Q);
         out.scale = ct1.scale * ct2.scale;
         out.ntt_form = true;
         return out;
