@@ -24,11 +24,14 @@ const std::vector<uint64_t> Q_LIMBS = {
     1152921504589938689ULL, 1152921504586530817ULL, 1152921504583647233ULL,
     1152921504581419009ULL, 1152921504552910849ULL, 1152921504552583169ULL
 };
+// const std::vector<uint64_t> P_LIMBS = {
+//     1152921504580894721ULL, 1152921504578666497ULL, 1152921504578273281ULL,
+//     1152921504577748993ULL, 1152921504577486849ULL, 1152921504570802177ULL,
+//     1152921504570277889ULL, 1152921504568836097ULL, 1152921504568442881ULL,
+//     1152921504565559297ULL, 1152921504565166081ULL
+// };
 const std::vector<uint64_t> P_LIMBS = {
-    1152921504580894721ULL, 1152921504578666497ULL, 1152921504578273281ULL,
-    1152921504577748993ULL, 1152921504577486849ULL, 1152921504570802177ULL,
-    1152921504570277889ULL, 1152921504568836097ULL, 1152921504568442881ULL,
-    1152921504565559297ULL, 1152921504565166081ULL
+    1152921504580894721ULL // Just 1
 };
 struct Plaintext {
     std::vector<std::vector<uint64_t>> data;
@@ -39,7 +42,11 @@ struct Ciphertext {
     std::vector<Plaintext> parts;
     double scale = DELTA;
 };
-
+struct RelinKeyP {
+    // [decomposition_index_k][target_limb_i][N_polynomial]
+    std::vector<std::vector<std::vector<uint64_t>>> b_Q, a_Q; 
+    std::vector<std::vector<std::vector<uint64_t>>> b_P, a_P; 
+};
 std::vector<uint64_t> poly_mult_naive (const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, uint64_t q){
     std::vector<__uint128_t> intermediate(2 * N -1, 0);
     #pragma omp parallel for
@@ -127,7 +134,14 @@ NTTTables precompute_ntt(uint64_t q, int N) {
     }
     return tables;
 }
-
+const NTTTables& get_tables(uint64_t q, int N) {
+    static std::unordered_map<uint64_t, NTTTables> cache;
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    auto it = cache.find(q);
+    if (it == cache.end()) it = cache.emplace(q, precompute_ntt(q, N)).first;
+    return it->second; // references into unordered_map stay valid across rehash
+}
 //Cooley-Tukey Forward NTT
 void ntt(std::vector<uint64_t>& a, const std::vector<uint64_t>& twiddles, uint64_t q, int N) {
     int t = N;
@@ -177,16 +191,7 @@ std::vector<uint64_t> ntt_mul(const std::vector<uint64_t>& A, const std::vector<
     
     //cache twiddles per prime to guarantee O(N log N) speed on repeat calls
     static std::unordered_map<uint64_t, NTTTables> cache;
-    static std::mutex cache_mutex;
-    
-    NTTTables tables;
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        if (cache.find(q) == cache.end()) {
-            cache[q] = precompute_ntt(q, N);
-        }
-        tables = cache[q];
-    }
+    const NTTTables& tables = get_tables(q, N);
 
     //mutable copies
     std::vector<uint64_t> a_ntt = A;
@@ -211,10 +216,6 @@ inline uint64_t wrap(int64_t x, uint64_t q) {
     int64_t rem = x % (int64_t)q;
     return rem < 0 ? (uint64_t)(rem + q) : (uint64_t)rem;
 }
-struct RelinKeyP {
-    std::vector<std::vector<uint64_t>> b_Q, a_Q; 
-    std::vector<std::vector<uint64_t>> b_P, a_P; 
-};
 class CKKSEngine {
 public:
 
@@ -309,20 +310,24 @@ public:
             }
         }
     }
-    //key is P * s^2
+    //key is P * q_k tilda *s^2 for every decomposed limb 
     //rewriting alot of enc algo (look at that first)
+    //
     RelinKeyP generate_relin_key(const std::vector<int>& secret) {
         RelinKeyP rlk;
-        size_t nQ = Q_LIMBS.size(), nP = P_LIMBS.size();
-        rlk.b_Q.resize(nQ, std::vector<uint64_t>(N)); rlk.a_Q.resize(nQ, std::vector<uint64_t>(N));
-        rlk.b_P.resize(nP, std::vector<uint64_t>(N)); rlk.a_P.resize(nP, std::vector<uint64_t>(N));
+        size_t nQ = Q_LIMBS.size();
+        size_t nP = P_LIMBS.size(); // This is now 1
+        
+        rlk.b_Q.resize(nQ, std::vector<std::vector<uint64_t>>(nQ, std::vector<uint64_t>(N)));
+        rlk.a_Q.resize(nQ, std::vector<std::vector<uint64_t>>(nQ, std::vector<uint64_t>(N)));
+        rlk.b_P.resize(nQ, std::vector<std::vector<uint64_t>>(nP, std::vector<uint64_t>(N)));
+        rlk.a_P.resize(nQ, std::vector<std::vector<uint64_t>>(nP, std::vector<uint64_t>(N)));
 
         std::random_device rd;
         std::mt19937_64 gen(rd());
         std::normal_distribution<double> gaussian_dist(0.0, 1.78885);
-        std::vector<int64_t> global_e(N);
-        for(int j = 0; j < N; j++) global_e[j] = std::round(gaussian_dist(gen));
 
+        //s^2
         std::vector<int64_t> s2(N, 0);
         for(int i = 0; i < N; ++i) {
             for(int j = 0; j < N; ++j) {
@@ -332,39 +337,87 @@ public:
             }
         }
 
-        for(size_t i = 0; i < nQ; i++) {
-            uint64_t mod = Q_LIMBS[i];
-            std::uniform_int_distribution<uint64_t> dist(0, mod - 1);
-            std::vector<uint64_t> a(N), s_mod(N), s2_mod(N);
-            for(int j = 0; j < N; j++) {
-                a[j] = dist(gen); s_mod[j] = wrap(secret[j], mod); s2_mod[j] = wrap(s2[j], mod);
-            }
-            std::vector<uint64_t> as = ntt_mul(a, s_mod, mod);
-            for(int j = 0; j < N; j++) {
-                uint64_t base = (mod - as[j]) % mod;
-                base = (base + wrap(global_e[j], mod)) % mod;
+        // Top-level Q calculation
+        mpz_class Q_val = 1; 
+        for (auto q : Q_LIMBS) Q_val *= q;
+        mpz_class P_val = P_LIMBS[0];
+
+        // Generate a separate key for each digit k
+        for (size_t k = 0; k < nQ; k++) {
+            // Calculate P * (Q / q_k) mod q_k
+            mpz_class Q_k = Q_val / Q_LIMBS[k];
+            uint64_t PQ_k_mod_qk = mpz_class(P_val * Q_k % Q_LIMBS[k]).get_ui();
+
+            std::vector<int64_t> global_e(N);
+            for(int j = 0; j < N; j++) global_e[j] = std::round(gaussian_dist(gen));
+
+            // Generate the Q-basis parts of the key
+            for(size_t i = 0; i < nQ; i++) {
+                uint64_t mod = Q_LIMBS[i];
+                std::uniform_int_distribution<uint64_t> dist(0, mod - 1);
+                std::vector<uint64_t> a(N), s_mod(N), s2_mod(N);
                 
-                uint64_t ps2 = (uint64_t)(((__uint128_t)P_mod_q[nQ - 1][i] * s2_mod[j]) % mod);
-                rlk.b_Q[i][j] = (base + ps2) % mod;
-                rlk.a_Q[i][j] = a[j];
+                for(int j = 0; j < N; j++) {
+                    a[j] = dist(gen); 
+                    s_mod[j] = wrap(secret[j], mod); 
+                    s2_mod[j] = wrap(s2[j], mod);
+                }
+                std::vector<uint64_t> as = ntt_mul(a, s_mod, mod);
+                
+                std::vector<uint64_t> base_vec(N);
+                for(int j = 0; j < N; j++) {
+                    uint64_t base = (mod - as[j]) % mod;
+                    base = (base + wrap(global_e[j], mod)) % mod;
+                    
+                    if (i == k) {
+                        uint64_t ps2 = (uint64_t)(((__uint128_t)PQ_k_mod_qk * s2_mod[j]) % mod);
+                        base = (base + ps2) % mod;
+                    }
+                    base_vec[j] = base;
+                }
+                
+                // CONVERT TO NTT DOMAIN BEFORE SAVING
+                const NTTTables& tables = get_tables(mod, N); // Use cache here in real code
+                ntt(base_vec, tables.forward_twiddles, mod, N);
+                ntt(a, tables.forward_twiddles, mod, N);
+                
+                for(int j = 0; j < N; j++) {
+                    rlk.b_Q[k][i][j] = base_vec[j];
+                    rlk.a_Q[k][i][j] = a[j];
+                }
+            }
+
+            // Generate the P-basis parts (no secret injection needed here mathematically)
+            for(size_t i = 0; i < nP; i++) {
+                uint64_t mod = P_LIMBS[i];
+                std::uniform_int_distribution<uint64_t> dist(0, mod - 1);
+                std::vector<uint64_t> a(N), s_mod(N);
+                
+                for(int j = 0; j < N; j++) {
+                    a[j] = dist(gen); 
+                    s_mod[j] = wrap(secret[j], mod);
+                }
+                
+                // ntt_mul returns the normal-format product a*s
+                std::vector<uint64_t> as = ntt_mul(a, s_mod, mod);
+                
+                std::vector<uint64_t> base_vec(N);
+                for(int j = 0; j < N; j++) {
+                    uint64_t base = (mod - as[j]) % mod;
+                    base_vec[j] = (base + wrap(global_e[j], mod)) % mod;
+                }
+                
+                // CONVERT TO NTT DOMAIN BEFORE SAVING
+                NTTTables tables = precompute_ntt(mod, N); 
+                ntt(base_vec, tables.forward_twiddles, mod, N);
+                ntt(a, tables.forward_twiddles, mod, N);
+                
+                for(int j = 0; j < N; j++) {
+                    rlk.b_P[k][i][j] = base_vec[j];
+                    rlk.a_P[k][i][j] = a[j];
+                }
             }
         }
-        //now that we have everything, make the key
-        for(size_t i = 0; i < nP; i++) {
-            uint64_t mod = P_LIMBS[i];
-            std::uniform_int_distribution<uint64_t> dist(0, mod - 1);
-            std::vector<uint64_t> a(N), s_mod(N);
-            for(int j = 0; j < N; j++) {
-                a[j] = dist(gen); s_mod[j] = wrap(secret[j], mod);
-            }
-            std::vector<uint64_t> as = ntt_mul(a, s_mod, mod);
-            for(int j = 0; j < N; j++) {
-                uint64_t base = (mod - as[j]) % mod;
-                rlk.b_P[i][j] = (base + wrap(global_e[j], mod)) % mod;
-                rlk.a_P[i][j] = a[j];
-            }
-        }
-        // printf("end of relin");
         return rlk;
     }
     //extend to QUP basis using precomputed swithing
@@ -406,40 +459,31 @@ public:
     }
 
     std::vector<std::vector<uint64_t>> fast_mod_down(
-        const std::vector<std::vector<uint64_t>>& c_Q, const std::vector<std::vector<uint64_t>>& c_P) {
+        const std::vector<std::vector<uint64_t>>& c_Q, const std::vector<uint64_t>& c_P) {
         
         size_t current_limbs = c_Q.size();
         size_t lvl = current_limbs - 1;
-        size_t nP = P_LIMBS.size();
         std::vector<std::vector<uint64_t>> res_Q(current_limbs, std::vector<uint64_t>(N, 0));
+        
+        uint64_t p_0 = P_LIMBS[0];
+        uint64_t p_half = p_0 / 2;
+
         #pragma omp parallel for
         for (int j = 0; j < N; j++) {
-            uint64_t sum_frac = 0, v = 0;
-            std::vector<uint64_t> x_prime(nP);
+            uint64_t e_p = c_P[j]; // c_P is now correctly accessed as 1D
             
-            for (size_t k = 0; k < nP; k++) {
-                uint64_t pk = P_LIMBS[k];
-                x_prime[k] = (uint64_t)(((__uint128_t)c_P[k][j] * p_hat_inv_mod_p[k]) % pk);
-                uint64_t frac = (uint64_t)(((__uint128_t)x_prime[k] << 64) / pk);
-                uint64_t old = sum_frac;
-                sum_frac += frac;
-                if (sum_frac < old) v++;
-            }
-            uint64_t old = sum_frac;
-            sum_frac += (1ULL << 63); 
-            if (sum_frac < old) v++;
-
             for (size_t i = 0; i < current_limbs; i++) {
                 uint64_t qi = Q_LIMBS[i];
-                __uint128_t sum = 0;
-                for (size_t k = 0; k < nP; k++) {
-                    sum += (__uint128_t)x_prime[k] * p_hat_mod_q[k][i];
+                uint64_t e_qi;
+                
+                // Center the noise digit around 0 before reducing it mod q_i
+                if (e_p > p_half) {
+                    e_qi = (qi - ((p_0 - e_p) % qi)) % qi;
+                } else {
+                    e_qi = e_p % qi;
                 }
-                uint64_t r_mod_qi = sum % qi;
-                uint64_t sub = ((__uint128_t)v * P_mod_q[lvl][i]) % qi;
-                r_mod_qi = (r_mod_qi + qi - sub) % qi;
-
-                uint64_t diff = (c_Q[i][j] + qi - r_mod_qi) % qi;
+                
+                uint64_t diff = (c_Q[i][j] + qi - e_qi) % qi;
                 res_Q[i][j] = (uint64_t)(((__uint128_t)diff * P_inv_mod_q[lvl][i]) % qi);
             }
         }
@@ -646,27 +690,57 @@ public:
             for (int j = 0; j < N; j++) d1[i][j] = (cross1[j] + cross2[j]) % qi;
         }
 
-        //extend to QUP basis and do relin
-        std::vector<std::vector<uint64_t>> d2_P = fast_mod_up(d2);
-        std::vector<std::vector<uint64_t>> r0_Q(current_limbs), r1_Q(current_limbs), r0_P(nP), r1_P(nP);
-        #pragma omp parallel for
-        for (size_t i = 0; i < current_limbs; i++) {
-            r0_Q[i] = ntt_mul(d2[i], rlk.b_Q[i], Q_LIMBS[i]);
-            r1_Q[i] = ntt_mul(d2[i], rlk.a_Q[i], Q_LIMBS[i]);
+        size_t nQ = Q_LIMBS.size();
+        uint64_t p_0 = P_LIMBS[0];
+
+        //Gadget digits: signed, centered mod q_k, computed once
+        std::vector<std::vector<int64_t>> digits(current_limbs, std::vector<int64_t>(N));
+        for (size_t k = 0; k < current_limbs; k++) {
+            uint64_t q_k = Q_LIMBS[k];
+            uint64_t inv = q_hat_inv_mod_q[nQ - 1][k];
+            for (int j = 0; j < N; j++) {
+                uint64_t v = (uint64_t)(((__uint128_t)d2[k][j] * inv) % q_k);
+                digits[k][j] = (v > q_k / 2) ? (int64_t)v - (int64_t)q_k : (int64_t)v;
+            }
         }
-        #pragma omp parallel for
-        for (size_t k = 0; k < nP; k++) {
-            r0_P[k] = ntt_mul(d2_P[k], rlk.b_P[k], P_LIMBS[k]);
-            r1_P[k] = ntt_mul(d2_P[k], rlk.a_P[k], P_LIMBS[k]);
+
+        //Inner product with the key, parallel over target limb 
+        std::vector<std::vector<uint64_t>> r0_Q(current_limbs), r1_Q(current_limbs);
+        std::vector<uint64_t> r0_P, r1_P;
+
+        #pragma omp parallel for schedule(dynamic)
+        for (int t = 0; t <= (int)current_limbs; t++) {
+            bool isP = (t == (int)current_limbs);
+            uint64_t mod = isP ? p_0 : Q_LIMBS[t];
+            const NTTTables& T = get_tables(mod, N);
+
+            std::vector<uint64_t> acc0(N, 0), acc1(N, 0), lifted(N);
+            for (size_t k = 0; k < current_limbs; k++) {
+                for (int j = 0; j < N; j++) lifted[j] = wrap(digits[k][j], mod);
+                ntt(lifted, T.forward_twiddles, mod, N);          // NTT only the digit
+
+                const auto& kb = isP ? rlk.b_P[k][0] : rlk.b_Q[k][t];  //already NTT domain
+                const auto& ka = isP ? rlk.a_P[k][0] : rlk.a_Q[k][t];
+                for (int j = 0; j < N; j++) {
+                    acc0[j] = (acc0[j] + (uint64_t)(((__uint128_t)lifted[j] * kb[j]) % mod)) % mod;
+                    acc1[j] = (acc1[j] + (uint64_t)(((__uint128_t)lifted[j] * ka[j]) % mod)) % mod;
+                }
+            }
+            intt(acc0, T.inverse_twiddles, mod, N, T.n_inv);      //back to coefficients BEFORE mod-down
+            intt(acc1, T.inverse_twiddles, mod, N, T.n_inv);
+
+            if (isP) { r0_P = std::move(acc0); r1_P = std::move(acc1); }
+            else     { r0_Q[t] = std::move(acc0); r1_Q[t] = std::move(acc1); }
         }
 
         auto relin_c0 = fast_mod_down(r0_Q, r0_P);
         auto relin_c1 = fast_mod_down(r1_Q, r1_P);
-
         Ciphertext ct_out;
         ct_out.parts.resize(2, Plaintext());
         ct_out.parts[0].data.resize(current_limbs, std::vector<uint64_t>(N, 0));
         ct_out.parts[1].data.resize(current_limbs, std::vector<uint64_t>(N, 0));
+        
+        //last Tensor Accumulation
         #pragma omp parallel for
         for (size_t i = 0; i < current_limbs; i++) {
             uint64_t qi = Q_LIMBS[i];
