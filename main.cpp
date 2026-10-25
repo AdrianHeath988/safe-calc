@@ -41,7 +41,16 @@ struct Plaintext {
 struct Ciphertext {
     std::vector<Plaintext> parts;
     double scale = DELTA;
+    bool ntt_form = false;
 };
+
+inline uint64_t mulmod(uint64_t a, uint64_t b, uint64_t q) {
+    return (uint64_t)(((__uint128_t)a * b) % q);
+}
+// |d| <= q_k/2 < mod for all our ~2^60 primes, so no division needed
+inline uint64_t lift_signed(int64_t d, uint64_t mod) {
+    return d < 0 ? (uint64_t)((int64_t)mod + d) : (uint64_t)d;
+}
 struct RelinKeyP {
     // [decomposition_index_k][target_limb_i][N_polynomial]
     std::vector<std::vector<std::vector<uint64_t>>> b_Q, a_Q; 
@@ -98,11 +107,14 @@ inline uint32_t bit_reverse(uint32_t val, int bit_length) {
 
 //Twiddle factor precomputation
 struct NTTTables {
-    std::vector<uint64_t> forward_twiddles;
-    std::vector<uint64_t> inverse_twiddles;
-    uint64_t n_inv;
+    std::vector<uint64_t> forward_twiddles, forward_twiddles_shoup;
+    std::vector<uint64_t> inverse_twiddles, inverse_twiddles_shoup;
+    uint64_t n_inv, n_inv_shoup;
 };
 
+inline uint64_t shoup_precomp(uint64_t W, uint64_t q) {
+    return (uint64_t)(((__uint128_t)W << 64) / q);   // one-time cost, % is fine here
+}
 NTTTables precompute_ntt(uint64_t q, int N) {
     NTTTables tables;
     tables.forward_twiddles.resize(N);
@@ -127,11 +139,19 @@ NTTTables precompute_ntt(uint64_t q, int N) {
 
     //powers in bit-reversed order for linear memory access in loops
     //WE LOVE THE CACHE BE NICE TO THE CACHE
-    for (int i = 0; i < N; i++) {
+        for (int i = 0; i < N; i++) {
         uint32_t rev = bit_reverse(i, logN);
         tables.forward_twiddles[i] = mod_exp(psi, rev, q);
         tables.inverse_twiddles[i] = mod_exp(psi_inv, rev, q);
     }
+
+    tables.forward_twiddles_shoup.resize(N);
+    tables.inverse_twiddles_shoup.resize(N);
+    for (int i = 0; i < N; i++) {
+        tables.forward_twiddles_shoup[i] = shoup_precomp(tables.forward_twiddles[i], q);
+        tables.inverse_twiddles_shoup[i] = shoup_precomp(tables.inverse_twiddles[i], q);
+    }
+    tables.n_inv_shoup = shoup_precomp(tables.n_inv, q);
     return tables;
 }
 const NTTTables& get_tables(uint64_t q, int N) {
@@ -142,47 +162,62 @@ const NTTTables& get_tables(uint64_t q, int N) {
     if (it == cache.end()) it = cache.emplace(q, precompute_ntt(q, N)).first;
     return it->second; // references into unordered_map stay valid across rehash
 }
+inline uint64_t mul_shoup_lazy(uint64_t a, uint64_t W, uint64_t Wp, uint64_t q) {
+    uint64_t hi = (uint64_t)(((__uint128_t)a * Wp) >> 64);
+    return a * W - hi * q;                        // [0, 2q)
+}
 //Cooley-Tukey Forward NTT
-void ntt(std::vector<uint64_t>& a, const std::vector<uint64_t>& twiddles, uint64_t q, int N) {
+void ntt(std::vector<uint64_t>& a, const NTTTables& T, uint64_t q, int N) {
+    const uint64_t q2 = 2 * q;
+    uint64_t* A = a.data();
     int t = N;
     for (int m = 1; m < N; m <<= 1) {
         t >>= 1;
         for (int i = 0; i < m; i++) {
             int j1 = 2 * i * t;
-            int j2 = j1 + t - 1;
-            uint64_t W = twiddles[m + i];
-            for (int j = j1; j <= j2; j++) {
-                uint64_t U = a[j];
-                uint64_t V = (uint64_t)(((__uint128_t)a[j + t] * W) % q);
-                a[j] = (U + V) % q;
-                a[j + t] = (U + q - V) % q;
+            const uint64_t W  = T.forward_twiddles[m + i];
+            const uint64_t Wp = T.forward_twiddles_shoup[m + i];
+            for (int j = j1; j < j1 + t; j++) {
+                uint64_t X = A[j];
+                if (X >= q2) X -= q2;
+                uint64_t Tm = mul_shoup_lazy(A[j + t], W, Wp, q);
+                A[j]     = X + Tm;                // [0, 4q)
+                A[j + t] = X - Tm + q2;           // [0, 4q)
             }
         }
+    }
+    for (int i = 0; i < N; i++) {                 // final reduction to [0, q)
+        uint64_t x = A[i];
+        if (x >= q2) x -= q2;
+        if (x >= q)  x -= q;
+        A[i] = x;
     }
 }
 
 //Gentleman-Sande Inverse NTT
-void intt(std::vector<uint64_t>& a, const std::vector<uint64_t>& inv_twiddles, uint64_t q, int N, uint64_t n_inv) {
+void intt(std::vector<uint64_t>& a, const NTTTables& T, uint64_t q, int N) {
+    const uint64_t q2 = 2 * q;
+    uint64_t* A = a.data();
     int t = 1;
     for (int m = N; m > 1; m >>= 1) {
-        int j1 = 0;
-        int h = m >> 1;
+        int j1 = 0, h = m >> 1;
         for (int i = 0; i < h; i++) {
-            int j2 = j1 + t - 1;
-            uint64_t W = inv_twiddles[h + i];
-            for (int j = j1; j <= j2; j++) {
-                uint64_t U = a[j];
-                uint64_t V = a[j + t];
-                a[j] = (U + V) % q;
-                a[j + t] = (uint64_t)(((__uint128_t)(U + q - V) * W) % q);
+            const uint64_t W  = T.inverse_twiddles[h + i];
+            const uint64_t Wp = T.inverse_twiddles_shoup[h + i];
+            for (int j = j1; j < j1 + t; j++) {
+                uint64_t X = A[j], Y = A[j + t];
+                uint64_t s = X + Y;
+                if (s >= q2) s -= q2;             // [0, 2q)
+                A[j]     = s;
+                A[j + t] = mul_shoup_lazy(X - Y + q2, W, Wp, q);   // [0, 2q)
             }
             j1 += 2 * t;
         }
         t <<= 1;
     }
-    //normalization
-    for (int i = 0; i < N; i++) {
-        a[i] = (uint64_t)(((__uint128_t)a[i] * n_inv) % q);
+    for (int i = 0; i < N; i++) {                 // normalize by n_inv, reduce to [0, q)
+        uint64_t x = mul_shoup_lazy(A[i], T.n_inv, T.n_inv_shoup, q);
+        A[i] = x >= q ? x - q : x;
     }
 }
 
@@ -197,8 +232,8 @@ std::vector<uint64_t> ntt_mul(const std::vector<uint64_t>& A, const std::vector<
     std::vector<uint64_t> a_ntt = A;
     std::vector<uint64_t> b_ntt = B;
     
-    ntt(a_ntt, tables.forward_twiddles, q, N);
-    ntt(b_ntt, tables.forward_twiddles, q, N);
+    ntt(a_ntt, tables, q, N);
+    ntt(b_ntt, tables, q, N);
     
     std::vector<uint64_t> c_ntt(N);
     
@@ -208,7 +243,7 @@ std::vector<uint64_t> ntt_mul(const std::vector<uint64_t>& A, const std::vector<
         c_ntt[i] = (uint64_t)(((__uint128_t)a_ntt[i] * b_ntt[i]) % q);
     }
     
-    intt(c_ntt, tables.inverse_twiddles, q, N, tables.n_inv);
+    intt(c_ntt, tables, q, N);
     
     return c_ntt;
 }
@@ -216,9 +251,10 @@ inline uint64_t wrap(int64_t x, uint64_t q) {
     int64_t rem = x % (int64_t)q;
     return rem < 0 ? (uint64_t)(rem + q) : (uint64_t)rem;
 }
+
 class CKKSEngine {
 public:
-
+    std::vector<const NTTTables*> tabQ, tabP;
     //setup phase for relin fast auxillirary bassi switch for later
     // --- Public Class Variables ---
     // [level][i]
@@ -237,6 +273,26 @@ public:
     //rescale dropping table
     std::vector<std::vector<uint64_t>> q_inv_mod_q; // [limb_to_drop][remaining_limb]
 
+
+    //c_Q: ntt form, modified in place.  c_P: coefficient form.
+    void mod_down_ntt(std::vector<std::vector<uint64_t>>& c_Q, const std::vector<uint64_t>& c_P) {
+        size_t L = c_Q.size(), lvl = L - 1;
+        uint64_t p0 = P_LIMBS[0], p_half = p0 / 2;
+        #pragma omp parallel for
+        for (int i = 0; i < (int)L; i++) {
+            uint64_t qi = Q_LIMBS[i];
+            std::vector<uint64_t> e(N);
+            for (int j = 0; j < N; j++) {
+                uint64_t ep = c_P[j];
+                e[j] = (ep > p_half) ? (qi - ((p0 - ep) % qi)) % qi : ep % qi;
+            }
+            ntt(e, *tabQ[i], qi, N);
+            for (int j = 0; j < N; j++) {
+                uint64_t diff = (c_Q[i][j] + qi - e[j]) % qi;
+                c_Q[i][j] = mulmod(diff, P_inv_mod_q[lvl][i], qi);
+            }
+        }
+    }
     void setup_rns_tables() {
         size_t nQ = Q_LIMBS.size(), nP = P_LIMBS.size();
 
@@ -309,6 +365,9 @@ public:
                 q_inv_mod_q[l][i] = inv.get_ui(); 
             }
         }
+        tabQ.resize(nQ); tabP.resize(nP);
+        for (size_t i = 0; i < nQ; i++) tabQ[i] = &get_tables(Q_LIMBS[i], N);
+        for (size_t i = 0; i < nP; i++) tabP[i] = &get_tables(P_LIMBS[i], N);
     }
     //key is P * q_k tilda *s^2 for every decomposed limb 
     //rewriting alot of enc algo (look at that first)
@@ -378,8 +437,8 @@ public:
                 
                 // CONVERT TO NTT DOMAIN BEFORE SAVING
                 const NTTTables& tables = get_tables(mod, N); // Use cache here in real code
-                ntt(base_vec, tables.forward_twiddles, mod, N);
-                ntt(a, tables.forward_twiddles, mod, N);
+                ntt(base_vec, tables, mod, N);
+                ntt(a, tables, mod, N);
                 
                 for(int j = 0; j < N; j++) {
                     rlk.b_Q[k][i][j] = base_vec[j];
@@ -409,8 +468,8 @@ public:
                 
                 // CONVERT TO NTT DOMAIN BEFORE SAVING
                 NTTTables tables = precompute_ntt(mod, N); 
-                ntt(base_vec, tables.forward_twiddles, mod, N);
-                ntt(a, tables.forward_twiddles, mod, N);
+                ntt(base_vec, tables, mod, N);
+                ntt(a, tables, mod, N);
                 
                 for(int j = 0; j < N; j++) {
                     rlk.b_P[k][i][j] = base_vec[j];
@@ -625,30 +684,28 @@ public:
                 // c1 = a
                 ct.parts[1].data[i][j] = a[j];
             }
+            const NTTTables& T = get_tables(qi, N);
+            ntt(ct.parts[0].data[i], T, qi, N);
+            ntt(ct.parts[1].data[i], T, qi, N);
         }
         ct.scale = pt.scale;
+        ct.ntt_form = true;
         return ct;
     }
-    Plaintext decrypt(const Ciphertext& ct, const std::vector<int>& secret){
+    Plaintext decrypt(const Ciphertext& ct, const std::vector<int>& secret) {
         Plaintext pt;
-        size_t current_limbs = ct.parts[0].data.size();
-        pt.data.resize(current_limbs, std::vector<uint64_t>(N, 0));
-        for (size_t i = 0; i < current_limbs; ++i) {
+        //replace so it mults in ntt form and intts once
+        size_t L = ct.parts[0].data.size();
+        pt.data.resize(L, std::vector<uint64_t>(N, 0));
+        for (size_t i = 0; i < L; ++i) {
             uint64_t qi = Q_LIMBS[i];
-            
-            //project secret key into field
-            std::vector<uint64_t> sk_limb(N);
-            for (int j = 0; j < N; ++j) {
-                sk_limb[j] = wrap(secret[j], qi);
-            }
-            
-            //compute c1 * s mod qi
-            std::vector<uint64_t> c1s = ntt_mul(ct.parts[1].data[i], sk_limb, qi);
-            
-            //compute m = c0 + c1*s mod qi
-            for (int j = 0; j < N; ++j) {
-                pt.data[i][j] = (ct.parts[0].data[i][j] + c1s[j]) % qi;
-            }
+            const NTTTables& T = *tabQ[i];
+            std::vector<uint64_t> sk(N);
+            for (int j = 0; j < N; ++j) sk[j] = wrap(secret[j], qi);
+            ntt(sk, T, qi, N);
+            for (int j = 0; j < N; ++j)
+                pt.data[i][j] = (ct.parts[0].data[i][j] + mulmod(ct.parts[1].data[i][j], sk[j], qi)) % qi;
+            intt(pt.data[i], T, qi, N);
         }
         pt.scale = ct.scale;
         return pt;
@@ -670,129 +727,135 @@ public:
                 ct.parts[1].data[i][j] = (intermediateB >= qi) ? (intermediateB - qi) : intermediateB;
             }
         }
+        ct.ntt_form = true; ct.scale = c1.scale;
         return ct;
     }
+    // WE WILL DESTROY A TRILLION DOLLAR CORPORATION WITH CACHE LOCALITY AND COMPILER DISRESPECT
     Ciphertext multiply(const Ciphertext& ct1, const Ciphertext& ct2, const RelinKeyP& rlk) {
-        size_t current_limbs = std::min(ct1.parts[0].data.size(), ct2.parts[0].data.size());
-        size_t nP = P_LIMBS.size();
-        //mult naive for now
-        std::vector<std::vector<uint64_t>> d0(current_limbs), d1(current_limbs), d2(current_limbs);
-        #pragma omp parallel for
-        for (size_t i = 0; i < current_limbs; i++) {
-            uint64_t qi = Q_LIMBS[i];
-            d0[i] = ntt_mul(ct1.parts[0].data[i], ct2.parts[0].data[i], qi);
-            d2[i] = ntt_mul(ct1.parts[1].data[i], ct2.parts[1].data[i], qi);
-            
-            auto cross1 = ntt_mul(ct1.parts[0].data[i], ct2.parts[1].data[i], qi);
-            auto cross2 = ntt_mul(ct1.parts[1].data[i], ct2.parts[0].data[i], qi);
-            
-            d1[i].resize(N);
-            for (int j = 0; j < N; j++) d1[i][j] = (cross1[j] + cross2[j]) % qi;
-        }
-
+        size_t L = std::min(ct1.parts[0].data.size(), ct2.parts[0].data.size());
         size_t nQ = Q_LIMBS.size();
         uint64_t p_0 = P_LIMBS[0];
 
-        //Gadget digits: signed, centered mod q_k, computed once
-        std::vector<std::vector<int64_t>> digits(current_limbs, std::vector<int64_t>(N));
-        for (size_t k = 0; k < current_limbs; k++) {
-            uint64_t q_k = Q_LIMBS[k];
-            uint64_t inv = q_hat_inv_mod_q[nQ - 1][k];
+        //tensr: pure pointwise, no transforms
+        std::vector<std::vector<uint64_t>> d0(L, std::vector<uint64_t>(N)),
+                                        d1(L, std::vector<uint64_t>(N)),
+                                        d2(L, std::vector<uint64_t>(N));
+        #pragma omp parallel for
+        for (int i = 0; i < (int)L; i++) {
+            uint64_t qi = Q_LIMBS[i];
+            const auto &a0 = ct1.parts[0].data[i], &a1 = ct1.parts[1].data[i];
+            const auto &b0 = ct2.parts[0].data[i], &b1 = ct2.parts[1].data[i];
             for (int j = 0; j < N; j++) {
-                uint64_t v = (uint64_t)(((__uint128_t)d2[k][j] * inv) % q_k);
-                digits[k][j] = (v > q_k / 2) ? (int64_t)v - (int64_t)q_k : (int64_t)v;
+                d0[i][j] = mulmod(a0[j], b0[j], qi);
+                d2[i][j] = mulmod(a1[j], b1[j], qi);
+                d1[i][j] = (mulmod(a0[j], b1[j], qi) + mulmod(a1[j], b0[j], qi)) % qi;
             }
         }
 
-        //Inner product with the key, parallel over target limb 
-        std::vector<std::vector<uint64_t>> r0_Q(current_limbs), r1_Q(current_limbs);
+        
+        //One intt per limb gets coefficients for centering
+        std::vector<std::vector<uint64_t>> dig_ntt(L, std::vector<uint64_t>(N));
+        std::vector<std::vector<int64_t>>  digits(L, std::vector<int64_t>(N));
+        #pragma omp parallel for
+        for (int k = 0; k < (int)L; k++) {
+            uint64_t q_k = Q_LIMBS[k];
+            uint64_t inv = q_hat_inv_mod_q[nQ - 1][k];
+            for (int j = 0; j < N; j++) dig_ntt[k][j] = mulmod(d2[k][j], inv, q_k);
+            std::vector<uint64_t> tmp = dig_ntt[k];
+            intt(tmp, *tabQ[k], q_k, N);
+            for (int j = 0; j < N; j++)
+                digits[k][j] = (tmp[j] > q_k / 2) ? (int64_t)tmp[j] - (int64_t)q_k : (int64_t)tmp[j];
+        }
+
+        //key inner product, parallel over target limb
+        std::vector<std::vector<uint64_t>> r0_Q(L), r1_Q(L);
         std::vector<uint64_t> r0_P, r1_P;
 
         #pragma omp parallel for schedule(dynamic)
-        for (int t = 0; t <= (int)current_limbs; t++) {
-            bool isP = (t == (int)current_limbs);
+        for (int t = 0; t <= (int)L; t++) {
+            bool isP = (t == (int)L);
             uint64_t mod = isP ? p_0 : Q_LIMBS[t];
-            const NTTTables& T = get_tables(mod, N);
+            const NTTTables& T = isP ? *tabP[0] : *tabQ[t];
 
             std::vector<uint64_t> acc0(N, 0), acc1(N, 0), lifted(N);
-            for (size_t k = 0; k < current_limbs; k++) {
-                for (int j = 0; j < N; j++) lifted[j] = wrap(digits[k][j], mod);
-                ntt(lifted, T.forward_twiddles, mod, N);          // NTT only the digit
-
-                const auto& kb = isP ? rlk.b_P[k][0] : rlk.b_Q[k][t];  //already NTT domain
+            for (size_t k = 0; k < L; k++) {
+                const uint64_t* lf;
+                if (!isP && (size_t)t == k) {
+                    lf = dig_ntt[k].data();// skip: already ntt
+                } else {
+                    for (int j = 0; j < N; j++) lifted[j] = lift_signed(digits[k][j], mod);
+                    ntt(lifted, T, mod, N);
+                    lf = lifted.data();
+                }
+                const auto& kb = isP ? rlk.b_P[k][0] : rlk.b_Q[k][t];   // NTT domain
                 const auto& ka = isP ? rlk.a_P[k][0] : rlk.a_Q[k][t];
                 for (int j = 0; j < N; j++) {
-                    acc0[j] = (acc0[j] + (uint64_t)(((__uint128_t)lifted[j] * kb[j]) % mod)) % mod;
-                    acc1[j] = (acc1[j] + (uint64_t)(((__uint128_t)lifted[j] * ka[j]) % mod)) % mod;
+                    acc0[j] = (acc0[j] + mulmod(lf[j], kb[j], mod)) % mod;
+                    acc1[j] = (acc1[j] + mulmod(lf[j], ka[j], mod)) % mod;
                 }
             }
-            intt(acc0, T.inverse_twiddles, mod, N, T.n_inv);      //back to coefficients BEFORE mod-down
-            intt(acc1, T.inverse_twiddles, mod, N, T.n_inv);
-
-            if (isP) { r0_P = std::move(acc0); r1_P = std::move(acc1); }
-            else     { r0_Q[t] = std::move(acc0); r1_Q[t] = std::move(acc1); }
+            if (isP) {   // only the P limb goes back to coefficients (intt)
+                intt(acc0, T, mod, N);
+                intt(acc1, T, mod, N);
+                r0_P = std::move(acc0); r1_P = std::move(acc1);
+            } else {     // Q limbs stay in NTT form
+                r0_Q[t] = std::move(acc0); r1_Q[t] = std::move(acc1);
+            }
         }
 
-        auto relin_c0 = fast_mod_down(r0_Q, r0_P);
-        auto relin_c1 = fast_mod_down(r1_Q, r1_P);
-        Ciphertext ct_out;
-        ct_out.parts.resize(2, Plaintext());
-        ct_out.parts[0].data.resize(current_limbs, std::vector<uint64_t>(N, 0));
-        ct_out.parts[1].data.resize(current_limbs, std::vector<uint64_t>(N, 0));
-        
-        //last Tensor Accumulation
+        //mod-down in NTT form (in place)
+        mod_down_ntt(r0_Q, r0_P);
+        mod_down_ntt(r1_Q, r1_P);
+
+        //combine, reusing d0/d1 buffers
+        Ciphertext out;
+        out.parts.resize(2);
+        out.parts[0].data = std::move(d0);
+        out.parts[1].data = std::move(d1);
         #pragma omp parallel for
-        for (size_t i = 0; i < current_limbs; i++) {
+        for (int i = 0; i < (int)L; i++) {
             uint64_t qi = Q_LIMBS[i];
             for (int j = 0; j < N; j++) {
-                ct_out.parts[0].data[i][j] = (d0[i][j] + relin_c0[i][j]) % qi;
-                ct_out.parts[1].data[i][j] = (d1[i][j] + relin_c1[i][j]) % qi;
+                out.parts[0].data[i][j] = (out.parts[0].data[i][j] + r0_Q[i][j]) % qi;
+                out.parts[1].data[i][j] = (out.parts[1].data[i][j] + r1_Q[i][j]) % qi;
             }
         }
-        ct_out.scale = ct1.scale * ct2.scale;
-        return ct_out;
+        out.scale = ct1.scale * ct2.scale;
+        out.ntt_form = true;
+        return out;
     }
+    
     Ciphertext rescale(const Ciphertext& ct) {
-        Ciphertext ct_out;
-        size_t current_limbs = ct.parts[0].data.size();
-        if (current_limbs <= 1) throw std::runtime_error("Cannot rescale a 1-limb ciphertext!");
+        size_t L = ct.parts[0].data.size();
+        if (L <= 1) throw std::runtime_error("Cannot rescale a 1-limb ciphertext!");
+        size_t l = L - 1;
+        uint64_t q_last = Q_LIMBS[l], q_last_half = q_last / 2;
 
-        size_t l = current_limbs - 1; //index of the limb being dropped
-        uint64_t q_last = Q_LIMBS[l];
-        uint64_t q_last_half = q_last / 2;
+        Ciphertext out;
+        out.parts.resize(2);
+        out.scale = ct.scale / (double)q_last;
+        out.ntt_form = true;
 
-        ct_out.parts.resize(2, Plaintext());
-        ct_out.parts[0].data.resize(l, std::vector<uint64_t>(N));
-        ct_out.parts[1].data.resize(l, std::vector<uint64_t>(N));
-        
-        //scale reduction
-        ct_out.scale = ct.scale / (double)q_last;
+        for (int p = 0; p < 2; p++) {
+            out.parts[p].data.assign(l, std::vector<uint64_t>(N));
+            std::vector<uint64_t> r = ct.parts[p].data[l];
+            intt(r, *tabQ[l], q_last, N);
 
-        for (int p = 0; p < 2; p++) {   //each part of the ct
             #pragma omp parallel for
-            for (int j = 0; j < N; j++) {
-                uint64_t r = ct.parts[p].data[l][j];
-                bool round_up = (r >= q_last_half);
-
-                for (size_t i = 0; i < l; i++) {
-                    uint64_t qi = Q_LIMBS[i];
-                    uint64_t A_i;
-                    
-                    if (!round_up) {
-                        A_i = r % qi;
-                    } else {
-                        //(r - q_last) mod qi
-                        uint64_t q_last_mod_qi = q_last % qi;
-                        A_i = (r % qi + qi - q_last_mod_qi) % qi;
-                    }
-
-                    //sub centered remainder and multiply by inverse
-                    uint64_t diff = (ct.parts[p].data[i][j] + qi - A_i) % qi;
-                    ct_out.parts[p].data[i][j] = (uint64_t)(((__uint128_t)diff * q_inv_mod_q[l][i]) % qi);
+            for (int i = 0; i < (int)l; i++) {
+                uint64_t qi = Q_LIMBS[i];
+                uint64_t ql_mod = q_last % qi;
+                std::vector<uint64_t> A(N);
+                for (int j = 0; j < N; j++)
+                    A[j] = (r[j] >= q_last_half) ? (r[j] % qi + qi - ql_mod) % qi : r[j] % qi;
+                ntt(A, *tabQ[i], qi, N);
+                for (int j = 0; j < N; j++) {
+                    uint64_t diff = (ct.parts[p].data[i][j] + qi - A[j]) % qi;
+                    out.parts[p].data[i][j] = mulmod(diff, q_inv_mod_q[l][i], qi);
                 }
             }
         }
-        return ct_out;
+        return out;
     }
 
 };
