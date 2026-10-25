@@ -166,59 +166,243 @@ inline uint64_t mul_shoup_lazy(uint64_t a, uint64_t W, uint64_t Wp, uint64_t q) 
     uint64_t hi = (uint64_t)(((__uint128_t)a * Wp) >> 64);
     return a * W - hi * q;                        // [0, 2q)
 }
-//Cooley-Tukey Forward NTT
+struct Red { uint64_t q, r64, r64p, op; };      // r64 = 2^64 mod q
+inline Red make_red(uint64_t q) {
+    uint64_t r = (uint64_t)((((__uint128_t)1) << 64) % q);
+    return { q, r, shoup_precomp(r, q), shoup_precomp(1, q) };
+}
+// any 128-bit x -> [0,q). Two Shoup mults, no division.
+inline uint64_t red128(__uint128_t x, const Red& c) {
+    uint64_t a = mul_shoup_lazy((uint64_t)(x >> 64), c.r64, c.r64p, c.q);
+    uint64_t b = mul_shoup_lazy((uint64_t)x, 1, c.op, c.q);
+    uint64_t r = a + b;
+    if (r >= 2 * c.q) r -= 2 * c.q;
+    if (r >= c.q) r -= c.q;
+    return r;
+}
+inline uint64_t addmod(uint64_t a, uint64_t b, uint64_t q) { uint64_t r = a + b; return r >= q ? r - q : r; }
+inline uint64_t submod(uint64_t a, uint64_t b, uint64_t q) { return a >= b ? a - b : a + q - b; }
+inline uint64_t red_once(uint64_t x, uint64_t m) { uint64_t y = x - m; return y < x ? y : x; }
+inline uint64_t mulc(uint64_t a, uint64_t c, uint64_t cp, uint64_t q) {   // a * constant
+    uint64_t r = mul_shoup_lazy(a, c, cp, q); return r >= q ? r - q : r;
+}
+// ---------- AVX-512 helpers ----------
+static inline __m512i mulhi64_v(__m512i a, __m512i b) {
+    const __m512i m32 = _mm512_set1_epi64(0xFFFFFFFFULL);
+    __m512i ah = _mm512_srli_epi64(a, 32), bh = _mm512_srli_epi64(b, 32);
+    __m512i p0 = _mm512_mul_epu32(a, b);
+    __m512i p1 = _mm512_mul_epu32(ah, b);
+    __m512i p2 = _mm512_mul_epu32(a, bh);
+    __m512i p3 = _mm512_mul_epu32(ah, bh);
+    __m512i mid = _mm512_add_epi64(_mm512_srli_epi64(p0, 32),
+                  _mm512_add_epi64(_mm512_and_si512(p1, m32), _mm512_and_si512(p2, m32)));
+    return _mm512_add_epi64(p3,
+           _mm512_add_epi64(_mm512_srli_epi64(p1, 32),
+           _mm512_add_epi64(_mm512_srli_epi64(p2, 32), _mm512_srli_epi64(mid, 32))));
+}
+// a*W - floor(a*Wp/2^64)*q  (mod 2^64)  ->  [0, 2q)
+static inline __m512i mulshoup_v(__m512i a, __m512i W, __m512i Wp, __m512i q) {
+    __m512i hi = mulhi64_v(a, Wp);
+    return _mm512_sub_epi64(_mm512_mullo_epi64(a, W), _mm512_mullo_epi64(hi, q));
+}
+static inline __m512i red_once_v(__m512i x, __m512i m) {   // x>=m ? x-m : x
+    return _mm512_min_epu64(x, _mm512_sub_epi64(x, m));
+}
+static inline void fwd_bfly_v(__m512i& X, __m512i& Y, __m512i W, __m512i Wp, __m512i q, __m512i q2) {
+    X = red_once_v(X, q2);
+    __m512i Tm = mulshoup_v(Y, W, Wp, q);
+    Y = _mm512_add_epi64(_mm512_sub_epi64(X, Tm), q2);
+    X = _mm512_add_epi64(X, Tm);
+}
+static inline void inv_bfly_v(__m512i& X, __m512i& Y, __m512i W, __m512i Wp, __m512i q, __m512i q2) {
+    __m512i S = _mm512_add_epi64(X, Y);
+    __m512i D = _mm512_add_epi64(_mm512_sub_epi64(X, Y), q2);
+    X = red_once_v(S, q2);
+    Y = mulshoup_v(D, W, Wp, q);
+}
+// 4 consecutive twiddles w0..w3 -> [w0 w0 w1 w1 w2 w2 w3 w3]
+static inline __m512i dup4_v(const uint64_t* p) {
+    __m512i w = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*)p));
+    return _mm512_permutexvar_epi64(_mm512_setr_epi64(0,0,1,1,2,2,3,3), w);
+}
+// 2 twiddles -> [a a a a b b b b]
+static inline __m512i split2_v(uint64_t a, uint64_t b) {
+    return _mm512_mask_set1_epi64(_mm512_set1_epi64((long long)a), 0xF0, (long long)b);
+}
+
+// ---------- forward NTT (Cooley-Tukey), AVX-512 ----------
 void ntt(std::vector<uint64_t>& a, const NTTTables& T, uint64_t q, int N) {
-    const uint64_t q2 = 2 * q;
-    uint64_t* A = a.data();
-    int t = N;
-    for (int m = 1; m < N; m <<= 1) {
+    const __m512i vq = _mm512_set1_epi64((long long)q), vq2 = _mm512_set1_epi64((long long)(2 * q));
+    uint64_t* __restrict A = a.data();
+    const uint64_t* __restrict Wt = T.forward_twiddles.data();
+    const uint64_t* __restrict Wps = T.forward_twiddles_shoup.data();
+
+    // stages with t >= 8
+    int t = N, m = 1;
+    for (; m <= N / 16; m <<= 1) {
         t >>= 1;
         for (int i = 0; i < m; i++) {
-            int j1 = 2 * i * t;
-            const uint64_t W  = T.forward_twiddles[m + i];
-            const uint64_t Wp = T.forward_twiddles_shoup[m + i];
-            for (int j = j1; j < j1 + t; j++) {
-                uint64_t X = A[j];
-                if (X >= q2) X -= q2;
-                uint64_t Tm = mul_shoup_lazy(A[j + t], W, Wp, q);
-                A[j]     = X + Tm;                // [0, 4q)
-                A[j + t] = X - Tm + q2;           // [0, 4q)
+            const __m512i W = _mm512_set1_epi64((long long)Wt[m + i]);
+            const __m512i Wp = _mm512_set1_epi64((long long)Wps[m + i]);
+            uint64_t* x = A + 2 * (size_t)i * t;
+            uint64_t* y = x + t;
+            for (int j = 0; j < t; j += 8) {
+                __m512i X = _mm512_loadu_si512(x + j), Y = _mm512_loadu_si512(y + j);
+                fwd_bfly_v(X, Y, W, Wp, vq, vq2);
+                _mm512_storeu_si512(x + j, X);
+                _mm512_storeu_si512(y + j, Y);
             }
         }
     }
-    for (int i = 0; i < N; i++) {                 // final reduction to [0, q)
-        uint64_t x = A[i];
-        if (x >= q2) x -= q2;
-        if (x >= q)  x -= q;
-        A[i] = x;
+
+    // last three stages (t=4,2,1) in registers, 16 coefficients per iteration
+    const __m512i iX1 = _mm512_setr_epi64(0,1,2,3,8,9,10,11),  iY1 = _mm512_setr_epi64(4,5,6,7,12,13,14,15);
+    const __m512i iX2 = _mm512_setr_epi64(0,1,8,9,4,5,12,13),  iY2 = _mm512_setr_epi64(2,3,10,11,6,7,14,15);
+    const __m512i iX3 = _mm512_setr_epi64(0,8,2,10,4,12,6,14), iY3 = _mm512_setr_epi64(1,9,3,11,5,13,7,15);
+    const __m512i iO0 = _mm512_setr_epi64(0,8,1,9,2,10,3,11),  iO1 = _mm512_setr_epi64(4,12,5,13,6,14,7,15);
+    const int c4 = N / 8, c2 = N / 4, c1 = N / 2;
+
+    for (int c = 0; c < N / 16; c++) {
+        uint64_t* p = A + 16 * (size_t)c;
+        __m512i v0 = _mm512_loadu_si512(p), v1 = _mm512_loadu_si512(p + 8);
+
+        // t = 4 : twiddle index c4 + 2c (+1 for the second 8-block)
+        __m512i X = _mm512_permutex2var_epi64(v0, iX1, v1), Y = _mm512_permutex2var_epi64(v0, iY1, v1);
+        fwd_bfly_v(X, Y, split2_v(Wt[c4 + 2*c], Wt[c4 + 2*c + 1]),
+                         split2_v(Wps[c4 + 2*c], Wps[c4 + 2*c + 1]), vq, vq2);
+
+        // t = 2 : twiddle index c2 + 4c .. +3, each used twice
+        __m512i X2 = _mm512_permutex2var_epi64(X, iX2, Y), Y2 = _mm512_permutex2var_epi64(X, iY2, Y);
+        fwd_bfly_v(X2, Y2, dup4_v(Wt + c2 + 4*c), dup4_v(Wps + c2 + 4*c), vq, vq2);
+
+        // t = 1 : twiddle index c1 + 8c .. +7
+        __m512i X3 = _mm512_permutex2var_epi64(X2, iX3, Y2), Y3 = _mm512_permutex2var_epi64(X2, iY3, Y2);
+        fwd_bfly_v(X3, Y3, _mm512_loadu_si512(Wt + c1 + 8*c), _mm512_loadu_si512(Wps + c1 + 8*c), vq, vq2);
+
+        // final reduction to [0, q)
+        X3 = red_once_v(red_once_v(X3, vq2), vq);
+        Y3 = red_once_v(red_once_v(Y3, vq2), vq);
+
+        _mm512_storeu_si512(p,     _mm512_permutex2var_epi64(X3, iO0, Y3));
+        _mm512_storeu_si512(p + 8, _mm512_permutex2var_epi64(X3, iO1, Y3));
     }
 }
 
-//Gentleman-Sande Inverse NTT
+// ---------- inverse NTT (Gentleman-Sande), AVX-512 ----------
 void intt(std::vector<uint64_t>& a, const NTTTables& T, uint64_t q, int N) {
-    const uint64_t q2 = 2 * q;
-    uint64_t* A = a.data();
-    int t = 1;
-    for (int m = N; m > 1; m >>= 1) {
-        int j1 = 0, h = m >> 1;
+    const __m512i vq = _mm512_set1_epi64((long long)q), vq2 = _mm512_set1_epi64((long long)(2 * q));
+    uint64_t* __restrict A = a.data();
+    const uint64_t* __restrict Wt = T.inverse_twiddles.data();
+    const uint64_t* __restrict Wps = T.inverse_twiddles_shoup.data();
+
+    // first three stages (t=1,2,4) in registers
+    const __m512i iX1 = _mm512_setr_epi64(0,2,4,6,8,10,12,14), iY1 = _mm512_setr_epi64(1,3,5,7,9,11,13,15);
+    const __m512i iX2 = _mm512_setr_epi64(0,8,2,10,4,12,6,14), iY2 = _mm512_setr_epi64(1,9,3,11,5,13,7,15);
+    const __m512i iX3 = _mm512_setr_epi64(0,1,8,9,4,5,12,13),  iY3 = _mm512_setr_epi64(2,3,10,11,6,7,14,15);
+    const __m512i iO0 = _mm512_setr_epi64(0,1,2,3,8,9,10,11),  iO1 = _mm512_setr_epi64(4,5,6,7,12,13,14,15);
+    const int h1 = N / 2, h2 = N / 4, h4 = N / 8;
+
+    for (int c = 0; c < N / 16; c++) {
+        uint64_t* p = A + 16 * (size_t)c;
+        __m512i v0 = _mm512_loadu_si512(p), v1 = _mm512_loadu_si512(p + 8);
+
+        // t = 1
+        __m512i X = _mm512_permutex2var_epi64(v0, iX1, v1), Y = _mm512_permutex2var_epi64(v0, iY1, v1);
+        inv_bfly_v(X, Y, _mm512_loadu_si512(Wt + h1 + 8*c), _mm512_loadu_si512(Wps + h1 + 8*c), vq, vq2);
+
+        // t = 2
+        __m512i X2 = _mm512_permutex2var_epi64(X, iX2, Y), Y2 = _mm512_permutex2var_epi64(X, iY2, Y);
+        inv_bfly_v(X2, Y2, dup4_v(Wt + h2 + 4*c), dup4_v(Wps + h2 + 4*c), vq, vq2);
+
+        // t = 4
+        __m512i X3 = _mm512_permutex2var_epi64(X2, iX3, Y2), Y3 = _mm512_permutex2var_epi64(X2, iY3, Y2);
+        inv_bfly_v(X3, Y3, split2_v(Wt[h4 + 2*c], Wt[h4 + 2*c + 1]),
+                           split2_v(Wps[h4 + 2*c], Wps[h4 + 2*c + 1]), vq, vq2);
+
+        _mm512_storeu_si512(p,     _mm512_permutex2var_epi64(X3, iO0, Y3));
+        _mm512_storeu_si512(p + 8, _mm512_permutex2var_epi64(X3, iO1, Y3));
+    }
+
+    // remaining stages, t >= 8
+    int t = 8;
+    for (int m = N / 8; m >= 2; m >>= 1) {
+        int h = m >> 1;
         for (int i = 0; i < h; i++) {
-            const uint64_t W  = T.inverse_twiddles[h + i];
-            const uint64_t Wp = T.inverse_twiddles_shoup[h + i];
-            for (int j = j1; j < j1 + t; j++) {
-                uint64_t X = A[j], Y = A[j + t];
-                uint64_t s = X + Y;
-                if (s >= q2) s -= q2;             // [0, 2q)
-                A[j]     = s;
-                A[j + t] = mul_shoup_lazy(X - Y + q2, W, Wp, q);   // [0, 2q)
+            const __m512i W = _mm512_set1_epi64((long long)Wt[h + i]);
+            const __m512i Wp = _mm512_set1_epi64((long long)Wps[h + i]);
+            uint64_t* x = A + 2 * (size_t)i * t;
+            uint64_t* y = x + t;
+            for (int j = 0; j < t; j += 8) {
+                __m512i X = _mm512_loadu_si512(x + j), Y = _mm512_loadu_si512(y + j);
+                inv_bfly_v(X, Y, W, Wp, vq, vq2);
+                _mm512_storeu_si512(x + j, X);
+                _mm512_storeu_si512(y + j, Y);
             }
-            j1 += 2 * t;
         }
         t <<= 1;
     }
-    for (int i = 0; i < N; i++) {                 // normalize by n_inv, reduce to [0, q)
-        uint64_t x = mul_shoup_lazy(A[i], T.n_inv, T.n_inv_shoup, q);
-        A[i] = x >= q ? x - q : x;
+
+    // normalize by n_inv, reduce to [0, q)
+    const __m512i Wn = _mm512_set1_epi64((long long)T.n_inv), Wnp = _mm512_set1_epi64((long long)T.n_inv_shoup);
+    for (int i = 0; i < N; i += 8) {
+        __m512i x = mulshoup_v(_mm512_loadu_si512(A + i), Wn, Wnp, vq);
+        _mm512_storeu_si512(A + i, red_once_v(x, vq));
     }
+}
+
+//Cooley-Tukey Forward NTT
+void ntt_scalar(std::vector<uint64_t>& a, const NTTTables& T, uint64_t q, int N) {
+    const uint64_t q2 = 2 * q;
+    uint64_t* __restrict A = a.data();
+    const uint64_t* __restrict Wt = T.forward_twiddles.data();
+    const uint64_t* __restrict Wps = T.forward_twiddles_shoup.data();
+    int t = N;
+    for (int m = 1; m < N / 2; m <<= 1) {
+        t >>= 1;
+        for (int i = 0; i < m; i++) {
+            const uint64_t W = Wt[m + i], Wp = Wps[m + i];
+            uint64_t* __restrict x = A + 2 * i * t;
+            uint64_t* __restrict y = x + t;
+            for (int j = 0; j < t; j++) {
+                uint64_t X = red_once(x[j], q2);
+                uint64_t Tm = mul_shoup_lazy(y[j], W, Wp, q);
+                x[j] = X + Tm;
+                y[j] = X - Tm + q2;
+            }
+        }
+    }
+    for (int i = 0; i < N / 2; i++) {            // last stage + final reduction
+        const uint64_t W = Wt[N / 2 + i], Wp = Wps[N / 2 + i];
+        uint64_t X = red_once(A[2 * i], q2);
+        uint64_t Tm = mul_shoup_lazy(A[2 * i + 1], W, Wp, q);
+        uint64_t u = X + Tm, v = X - Tm + q2;
+        A[2 * i]     = red_once(red_once(u, q2), q);
+        A[2 * i + 1] = red_once(red_once(v, q2), q);
+    }
+}
+//gentelemane snade intt
+void intt_scalar(std::vector<uint64_t>& a, const NTTTables& T, uint64_t q, int N) {
+    const uint64_t q2 = 2 * q;
+    uint64_t* __restrict A = a.data();
+    const uint64_t* __restrict Wt = T.inverse_twiddles.data();
+    const uint64_t* __restrict Wps = T.inverse_twiddles_shoup.data();
+    int t = 1;
+    for (int m = N; m > 1; m >>= 1) {
+        int h = m >> 1;
+        for (int i = 0; i < h; i++) {
+            const uint64_t W = Wt[h + i], Wp = Wps[h + i];
+            uint64_t* __restrict x = A + 2 * i * t;
+            uint64_t* __restrict y = x + t;
+            for (int j = 0; j < t; j++) {
+                uint64_t X = x[j], Y = y[j];
+                x[j] = red_once(X + Y, q2);
+                y[j] = mul_shoup_lazy(X - Y + q2, W, Wp, q);
+            }
+        }
+        t <<= 1;
+    }
+    for (int i = 0; i < N; i++)
+        A[i] = red_once(mul_shoup_lazy(A[i], T.n_inv, T.n_inv_shoup, q), q);
 }
 
 std::vector<uint64_t> ntt_mul(const std::vector<uint64_t>& A, const std::vector<uint64_t>& B, uint64_t q) {
@@ -251,10 +435,14 @@ inline uint64_t wrap(int64_t x, uint64_t q) {
     int64_t rem = x % (int64_t)q;
     return rem < 0 ? (uint64_t)(rem + q) : (uint64_t)rem;
 }
-
+double g_ph[6] = {0};
+const char* g_phn[6] = {"tensor","digit+intt","key product","mod-down","combine","rescale"};
 class CKKSEngine {
 public:
     std::vector<const NTTTables*> tabQ, tabP;
+    std::vector<Red> redQ; Red redP;
+    std::vector<uint64_t> qhi_p;                          // shoup of q_hat_inv_mod_q[nQ-1][k]
+    std::vector<std::vector<uint64_t>> Pinv_p, qinv_p;    // shoup of P_inv_mod_q[lvl][i], q_inv_mod_q[l][i]
     //setup phase for relin fast auxillirary bassi switch for later
     // --- Public Class Variables ---
     // [level][i]
@@ -284,13 +472,13 @@ public:
             std::vector<uint64_t> e(N);
             for (int j = 0; j < N; j++) {
                 uint64_t ep = c_P[j];
-                e[j] = (ep > p_half) ? (qi - ((p0 - ep) % qi)) % qi : ep % qi;
+                // all primes are ~2^60, so p0-ep < p0/2 < qi and ep <= p0/2 < qi: no division
+                e[j] = (ep > p_half) ? qi - (p0 - ep) : ep;
             }
             ntt(e, *tabQ[i], qi, N);
-            for (int j = 0; j < N; j++) {
-                uint64_t diff = (c_Q[i][j] + qi - e[j]) % qi;
-                c_Q[i][j] = mulmod(diff, P_inv_mod_q[lvl][i], qi);
-            }
+            const uint64_t c = P_inv_mod_q[lvl][i], cp = Pinv_p[lvl][i];
+            for (int j = 0; j < N; j++)
+                c_Q[i][j] = mulc(submod(c_Q[i][j], e[j], qi), c, cp, qi);
         }
     }
     void setup_rns_tables() {
@@ -368,6 +556,19 @@ public:
         tabQ.resize(nQ); tabP.resize(nP);
         for (size_t i = 0; i < nQ; i++) tabQ[i] = &get_tables(Q_LIMBS[i], N);
         for (size_t i = 0; i < nP; i++) tabP[i] = &get_tables(P_LIMBS[i], N);
+        redQ.resize(nQ);
+        for (size_t i = 0; i < nQ; i++) redQ[i] = make_red(Q_LIMBS[i]);
+        redP = make_red(P_LIMBS[0]);
+                qhi_p.resize(nQ);
+        Pinv_p.assign(nQ, std::vector<uint64_t>(nQ, 0));
+        qinv_p.assign(nQ, std::vector<uint64_t>(nQ, 0));
+        for (size_t i = 0; i < nQ; i++) {
+            qhi_p[i] = shoup_precomp(q_hat_inv_mod_q[nQ - 1][i], Q_LIMBS[i]);
+            for (size_t lvl = i; lvl < nQ; lvl++)
+                Pinv_p[lvl][i] = shoup_precomp(P_inv_mod_q[lvl][i], Q_LIMBS[i]);
+            for (size_t l = i + 1; l < nQ; l++)
+                qinv_p[l][i] = shoup_precomp(q_inv_mod_q[l][i], Q_LIMBS[i]);
+        }
     }
     //key is P * q_k tilda *s^2 for every decomposed limb 
     //rewriting alot of enc algo (look at that first)
@@ -719,19 +920,18 @@ public:
         ct.parts[1].data.resize(current_limbs, std::vector<uint64_t>(N, 0));
         for(int i=0;i<current_limbs;i++){    //per limb
             uint64_t qi = Q_LIMBS[i];
-            for(int j=0;j<N;j++){
-                uint64_t intermediateA = c1.parts[0].data[i][j]+ c2.parts[0].data[i][j];
-                uint64_t intermediateB = c1.parts[1].data[i][j]+ c2.parts[1].data[i][j];
-                
-                ct.parts[0].data[i][j] = (intermediateA >= qi) ? (intermediateA - qi) : intermediateA;
-                ct.parts[1].data[i][j] = (intermediateB >= qi) ? (intermediateB - qi) : intermediateB;
+            for (int j = 0; j < N; j++) {
+                ct.parts[0].data[i][j] = addmod(c1.parts[0].data[i][j], c2.parts[0].data[i][j], qi);
+                ct.parts[1].data[i][j] = addmod(c1.parts[1].data[i][j], c2.parts[1].data[i][j], qi);
             }
         }
         ct.ntt_form = true; ct.scale = c1.scale;
         return ct;
     }
     // WE WILL DESTROY A TRILLION DOLLAR CORPORATION WITH CACHE LOCALITY AND COMPILER DISRESPECT
+    //THE SILICON WILL OBEY
     Ciphertext multiply(const Ciphertext& ct1, const Ciphertext& ct2, const RelinKeyP& rlk) {
+        double w = omp_get_wtime();
         size_t L = std::min(ct1.parts[0].data.size(), ct2.parts[0].data.size());
         size_t nQ = Q_LIMBS.size();
         uint64_t p_0 = P_LIMBS[0];
@@ -742,16 +942,16 @@ public:
                                         d2(L, std::vector<uint64_t>(N));
         #pragma omp parallel for
         for (int i = 0; i < (int)L; i++) {
-            uint64_t qi = Q_LIMBS[i];
+            const Red& R = redQ[i];
             const auto &a0 = ct1.parts[0].data[i], &a1 = ct1.parts[1].data[i];
             const auto &b0 = ct2.parts[0].data[i], &b1 = ct2.parts[1].data[i];
             for (int j = 0; j < N; j++) {
-                d0[i][j] = mulmod(a0[j], b0[j], qi);
-                d2[i][j] = mulmod(a1[j], b1[j], qi);
-                d1[i][j] = (mulmod(a0[j], b1[j], qi) + mulmod(a1[j], b0[j], qi)) % qi;
+                d0[i][j] = red128((__uint128_t)a0[j] * b0[j], R);
+                d2[i][j] = red128((__uint128_t)a1[j] * b1[j], R);
+                d1[i][j] = red128((__uint128_t)a0[j] * b1[j] + (__uint128_t)a1[j] * b0[j], R);
             }
         }
-
+        g_ph[0] += omp_get_wtime() - w; w = omp_get_wtime();
         
         //One intt per limb gets coefficients for centering
         std::vector<std::vector<uint64_t>> dig_ntt(L, std::vector<uint64_t>(N));
@@ -760,13 +960,13 @@ public:
         for (int k = 0; k < (int)L; k++) {
             uint64_t q_k = Q_LIMBS[k];
             uint64_t inv = q_hat_inv_mod_q[nQ - 1][k];
-            for (int j = 0; j < N; j++) dig_ntt[k][j] = mulmod(d2[k][j], inv, q_k);
+            for (int j = 0; j < N; j++) dig_ntt[k][j] = mulc(d2[k][j], inv, qhi_p[k], q_k);
             std::vector<uint64_t> tmp = dig_ntt[k];
             intt(tmp, *tabQ[k], q_k, N);
             for (int j = 0; j < N; j++)
                 digits[k][j] = (tmp[j] > q_k / 2) ? (int64_t)tmp[j] - (int64_t)q_k : (int64_t)tmp[j];
         }
-
+        g_ph[1] += omp_get_wtime() - w; w = omp_get_wtime();
         //key inner product, parallel over target limb
         std::vector<std::vector<uint64_t>> r0_Q(L), r1_Q(L);
         std::vector<uint64_t> r0_P, r1_P;
@@ -776,12 +976,16 @@ public:
             bool isP = (t == (int)L);
             uint64_t mod = isP ? p_0 : Q_LIMBS[t];
             const NTTTables& T = isP ? *tabP[0] : *tabQ[t];
+            const Red& R = isP ? redP : redQ[t];
 
-            std::vector<uint64_t> acc0(N, 0), acc1(N, 0), lifted(N);
+            // 128-bit lazy accumulators: 12 terms * 2^120 < 2^124, no overflow
+            std::vector<__uint128_t> a0(N, 0), a1(N, 0);
+            std::vector<uint64_t> lifted(N);
+
             for (size_t k = 0; k < L; k++) {
                 const uint64_t* lf;
                 if (!isP && (size_t)t == k) {
-                    lf = dig_ntt[k].data();// skip: already ntt
+                    lf = dig_ntt[k].data();               // skip: already NTT form
                 } else {
                     for (int j = 0; j < N; j++) lifted[j] = lift_signed(digits[k][j], mod);
                     ntt(lifted, T, mod, N);
@@ -790,11 +994,19 @@ public:
                 const auto& kb = isP ? rlk.b_P[k][0] : rlk.b_Q[k][t];   // NTT domain
                 const auto& ka = isP ? rlk.a_P[k][0] : rlk.a_Q[k][t];
                 for (int j = 0; j < N; j++) {
-                    acc0[j] = (acc0[j] + mulmod(lf[j], kb[j], mod)) % mod;
-                    acc1[j] = (acc1[j] + mulmod(lf[j], ka[j], mod)) % mod;
+                    a0[j] += (__uint128_t)lf[j] * kb[j];
+                    a1[j] += (__uint128_t)lf[j] * ka[j];
                 }
             }
-            if (isP) {   // only the P limb goes back to coefficients (intt)
+
+            // one reduction per coefficient, after all k terms are summed
+            std::vector<uint64_t> acc0(N), acc1(N);
+            for (int j = 0; j < N; j++) {
+                acc0[j] = red128(a0[j], R);
+                acc1[j] = red128(a1[j], R);
+            }
+
+            if (isP) {   // only the P limb goes back to coefficients
                 intt(acc0, T, mod, N);
                 intt(acc1, T, mod, N);
                 r0_P = std::move(acc0); r1_P = std::move(acc1);
@@ -802,11 +1014,11 @@ public:
                 r0_Q[t] = std::move(acc0); r1_Q[t] = std::move(acc1);
             }
         }
-
+        g_ph[2] += omp_get_wtime() - w; w = omp_get_wtime();
         //mod-down in NTT form (in place)
         mod_down_ntt(r0_Q, r0_P);
         mod_down_ntt(r1_Q, r1_P);
-
+        g_ph[3] += omp_get_wtime() - w; w = omp_get_wtime();
         //combine, reusing d0/d1 buffers
         Ciphertext out;
         out.parts.resize(2);
@@ -816,16 +1028,18 @@ public:
         for (int i = 0; i < (int)L; i++) {
             uint64_t qi = Q_LIMBS[i];
             for (int j = 0; j < N; j++) {
-                out.parts[0].data[i][j] = (out.parts[0].data[i][j] + r0_Q[i][j]) % qi;
-                out.parts[1].data[i][j] = (out.parts[1].data[i][j] + r1_Q[i][j]) % qi;
+                out.parts[0].data[i][j] = addmod(out.parts[0].data[i][j], r0_Q[i][j], qi);
+                out.parts[1].data[i][j] = addmod(out.parts[1].data[i][j], r1_Q[i][j], qi);
             }
         }
+        g_ph[4] += omp_get_wtime() - w; w = omp_get_wtime();
         out.scale = ct1.scale * ct2.scale;
         out.ntt_form = true;
         return out;
     }
     
     Ciphertext rescale(const Ciphertext& ct) {
+        double w = omp_get_wtime();
         size_t L = ct.parts[0].data.size();
         if (L <= 1) throw std::runtime_error("Cannot rescale a 1-limb ciphertext!");
         size_t l = L - 1;
@@ -844,17 +1058,19 @@ public:
             #pragma omp parallel for
             for (int i = 0; i < (int)l; i++) {
                 uint64_t qi = Q_LIMBS[i];
-                uint64_t ql_mod = q_last % qi;
+                uint64_t ql_mod = q_last >= qi ? q_last - qi : q_last;   // q_last mod qi
+                const uint64_t c = q_inv_mod_q[l][i], cp = qinv_p[l][i];
                 std::vector<uint64_t> A(N);
-                for (int j = 0; j < N; j++)
-                    A[j] = (r[j] >= q_last_half) ? (r[j] % qi + qi - ql_mod) % qi : r[j] % qi;
-                ntt(A, *tabQ[i], qi, N);
                 for (int j = 0; j < N; j++) {
-                    uint64_t diff = (ct.parts[p].data[i][j] + qi - A[j]) % qi;
-                    out.parts[p].data[i][j] = mulmod(diff, q_inv_mod_q[l][i], qi);
+                    uint64_t rm = r[j] >= qi ? r[j] - qi : r[j];          // r < q_last < 2*qi
+                    A[j] = (r[j] >= q_last_half) ? submod(rm, ql_mod, qi) : rm;
                 }
+                ntt(A, *tabQ[i], qi, N);
+                for (int j = 0; j < N; j++)
+                    out.parts[p].data[i][j] = mulc(submod(ct.parts[p].data[i][j], A[j], qi), c, cp, qi);
             }
         }
+        g_ph[5] += omp_get_wtime() - w;
         return out;
     }
 
@@ -886,7 +1102,36 @@ int main(){
 
     std::cout << "Setting up relin P tables" << std::endl;
     engine.setup_rns_tables(); 
-    
+    // for (int it = 0; it < 1000000; it++) {
+    //     __uint128_t x = ((__uint128_t)gen() << 64 | gen()) >> (gen() % 5);   // up to ~2^124 range
+    //     for (size_t i = 0; i < Q_LIMBS.size(); i++)
+    //         if (red128(x, engine.redQ[i]) != (uint64_t)(x % Q_LIMBS[i])) { puts("red128 mismatch"); exit(1); }
+    // }
+
+    {
+        std::vector<uint64_t> v(N);
+        for (auto& x : v) x = gen() % Q_LIMBS[0];
+        auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < 200; r++) { ntt(v, *engine.tabQ[0], Q_LIMBS[0], N); intt(v, *engine.tabQ[0], Q_LIMBS[0], N); }
+        double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+        printf("%.2f ns per butterfly\n", ns / (400.0 * 15 * (N / 2)));
+    }
+    {
+        bool ok = true;
+        for (size_t li = 0; li < Q_LIMBS.size() && ok; li++) {
+            uint64_t q = Q_LIMBS[li];
+            std::vector<uint64_t> v(N), s, w;
+            for (auto& x : v) x = gen() % q;
+            s = v; w = v;
+            ntt_scalar(s, *engine.tabQ[li], q, N);
+            ntt(w, *engine.tabQ[li], q, N);
+            if (s != w) { printf("fwd mismatch limb %zu\n", li); ok = false; break; }
+            intt_scalar(s, *engine.tabQ[li], q, N);
+            intt(w, *engine.tabQ[li], q, N);
+            if (s != w || w != v) { printf("inv mismatch limb %zu\n", li); ok = false; }
+        }
+        puts(ok ? "AVX512 NTT ok" : "AVX512 NTT FAILED");
+    }
     std::cout << "Gen relin key." << std::endl;
     RelinKeyP rlk = engine.generate_relin_key(s_key);
 
@@ -930,6 +1175,7 @@ int main(){
     //# plaintext ops is N/2 * 10
     std::cout << "Total number of plaintext operations = 10 * 16,384 = 163,840"<< std::endl;
     std::cout << "Total number of plaintext operations per second: " << 163840.0/(elapsed.count()/1000.0) << std::endl;
+    for (int i = 0; i < 6; i++) printf("%-12s %.1f ms\n", g_phn[i], g_ph[i] * 1000);
     // std::cout << m_ops/(elapsed.count() /1000.0) << " million operations per second." <<std::endl;
 
     std::cout << "decrypting" << std::endl;
